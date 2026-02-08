@@ -1,0 +1,44 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/harmony-labs/agent"
+description = "Claude Code agent toolkit: guard, score, and more"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.3", features = ["derive"] }
+dirs = "5"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.3"
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+# cargo-binstall metadata
+[package.metadata.binstall]
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/agent-darwin-x64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/agent-darwin-arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/agent-linux-x64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/agent-linux-arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/agent-windows-x64.zip"
+pkg-fmt = "zip"
