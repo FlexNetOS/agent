@@ -24,7 +24,10 @@ const DEFAULT_CONFIG: &str = include_str!("../.claude/agent-guard.toml");
 static CACHED_PATTERNS: OnceLock<Vec<CompiledPattern>> = OnceLock::new();
 
 /// Agent guard configuration structure (versioned schema).
+/// Fields `schema_version` and `metadata` are deserialized for forward compat
+/// and future schema migration; only `patterns` is actively used today.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct GuardConfig {
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
@@ -34,8 +37,9 @@ pub struct GuardConfig {
     pub patterns: Vec<PatternDefinition>,
 }
 
-/// Metadata about the configuration file.
+/// Metadata about the configuration file (reserved for future tooling).
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ConfigMetadata {
     pub source: String,
     pub version: String,
