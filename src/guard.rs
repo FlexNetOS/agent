@@ -1,8 +1,14 @@
-//! Deterministic destructive command detection for Claude Code PreToolUse hooks.
+//! Deterministic destructive command detection and file path sandboxing for
+//! Claude Code PreToolUse hooks.
 //!
-//! Reads hook JSON from stdin, evaluates the Bash command for destructive patterns,
-//! and returns structured JSON to block or allow execution. No LLM evaluation —
-//! pure pattern matching in Rust.
+//! Reads hook JSON from stdin, evaluates the tool input, and returns structured
+//! JSON to block or allow execution. No LLM evaluation — pure pattern matching
+//! in Rust.
+//!
+//! Two modes:
+//! - **Bash guard**: Evaluates Bash commands for destructive patterns (always active).
+//! - **File path sandbox**: When `AGENT_ALLOWED_PATHS` is set, restricts Edit/Write/Read/
+//!   NotebookEdit tools to allowed directory prefixes. Inactive in interactive mode.
 //!
 //! Configuration is loaded from `.claude/agent-guard.toml` (project-level) or
 //! `~/.claude/agent-guard.toml` (user-level), with embedded defaults as fallback.
@@ -286,11 +292,70 @@ impl GuardConfig {
 
 /// Entry point for `meta agent guard`.
 ///
-/// Reads PreToolUse hook JSON from stdin, evaluates the command,
-/// prints denial JSON to stdout if destructive, exits silently if safe.
+/// Reads PreToolUse hook JSON from stdin, evaluates the tool input,
+/// prints denial JSON to stdout if blocked, exits silently if safe.
+///
+/// For Bash tools: checks command against destructive patterns.
+/// For Edit/Write/Read/NotebookEdit: validates file_path against `AGENT_ALLOWED_PATHS`.
 pub fn handle_guard() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let hook_input: HookInput = match serde_json::from_str(trimmed) {
+        Ok(hi) => hi,
+        Err(_) => return Ok(()), // Malformed input — allow
+    };
+
+    let tool_name = hook_input.tool_name.as_deref().unwrap_or("");
+
+    // File-path tools: validate ALL path fields against allowed directories.
+    // Both file_path and notebook_path are checked when present, preventing
+    // bypass via a payload that smuggles a second path field.
+    if matches!(tool_name, "Edit" | "Write" | "Read" | "NotebookEdit") {
+        let paths: Vec<&String> = hook_input
+            .tool_input
+            .as_ref()
+            .map(|ti| {
+                let mut v = Vec::new();
+                if let Some(fp) = ti.file_path.as_ref() {
+                    v.push(fp);
+                }
+                if let Some(np) = ti.notebook_path.as_ref() {
+                    v.push(np);
+                }
+                v
+            })
+            .unwrap_or_default();
+
+        if paths.is_empty() {
+            // When sandboxing is active, deny file-path tools with no path
+            // to prevent bypass via malformed payloads
+            if std::env::var_os("AGENT_ALLOWED_PATHS").is_some_and(|v| !v.is_empty()) {
+                emit_denial(format!(
+                    "{} blocked: no file path provided for sandboxed tool.",
+                    tool_name
+                ))?;
+            }
+        } else {
+            for fp in &paths {
+                if let Some(denial) = evaluate_file_path(tool_name, fp) {
+                    emit_denial(denial.reason)?;
+                    break;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Only evaluate Bash tool for destructive command patterns
+    if !matches!(tool_name, "" | "Bash") {
+        return Ok(());
+    }
 
     let command = match parse_command(&input) {
         Some(cmd) => cmd,
@@ -298,14 +363,7 @@ pub fn handle_guard() -> Result<()> {
     };
 
     if let Some(denial) = evaluate_command(&command) {
-        let output = HookOutput {
-            hook_specific_output: HookSpecificOutput {
-                hook_event_name: "PreToolUse".to_string(),
-                permission_decision: "deny".to_string(),
-                permission_decision_reason: denial.reason,
-            },
-        };
-        println!("{}", serde_json::to_string(&output)?);
+        emit_denial(denial.reason)?;
     }
 
     Ok(())
@@ -315,12 +373,15 @@ pub fn handle_guard() -> Result<()> {
 
 #[derive(Deserialize)]
 struct HookInput {
+    tool_name: Option<String>,
     tool_input: Option<ToolInput>,
 }
 
 #[derive(Deserialize)]
 struct ToolInput {
     command: Option<String>,
+    file_path: Option<String>,
+    notebook_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -343,6 +404,150 @@ struct HookSpecificOutput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenyReason {
     pub reason: String,
+}
+
+/// Emit a denial JSON response to stdout.
+fn emit_denial(reason: String) -> Result<()> {
+    let output = HookOutput {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: "deny".to_string(),
+            permission_decision_reason: reason,
+        },
+    };
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+// ── File Path Sandboxing ────────────────────────────────
+
+/// Validate a file path against `AGENT_ALLOWED_PATHS` (OS-native path list: `:` on Unix, `;` on Windows).
+///
+/// When the env var is unset or empty, all paths are allowed (interactive mode).
+/// When set, the resolved path must start with at least one allowed prefix.
+/// Resolves symlinks and `..` components to prevent path traversal escapes.
+pub fn evaluate_file_path(tool_name: &str, file_path: &str) -> Option<DenyReason> {
+    let allowed = match std::env::var_os("AGENT_ALLOWED_PATHS") {
+        Some(v) if !v.is_empty() => v.to_string_lossy().to_string(),
+        _ => return None, // No restriction in interactive mode
+    };
+
+    evaluate_file_path_with_allowed(tool_name, file_path, &allowed)
+}
+
+/// Inner implementation that accepts allowed paths explicitly (testable without env vars).
+fn evaluate_file_path_with_allowed(
+    tool_name: &str,
+    file_path: &str,
+    allowed: &str,
+) -> Option<DenyReason> {
+    // Reject empty and relative paths early — Claude Code should always send absolute paths,
+    // so anything else is suspicious. This prevents CWD-dependent canonicalization surprises.
+    let trimmed_path = file_path.trim();
+    if trimmed_path.is_empty() || !Path::new(trimmed_path).is_absolute() {
+        return Some(DenyReason {
+            reason: format!(
+                "{} blocked: path must be absolute, got '{}'.",
+                tool_name, file_path
+            ),
+        });
+    }
+
+    // Resolve the path to catch traversal (../../..) and symlink escapes.
+    // For files that don't exist yet (Write creating new file), resolve the parent.
+    let resolved = resolve_path(trimmed_path);
+
+    // Debug logging
+    if std::env::var("META_DEBUG_GUARD").is_ok() {
+        eprintln!(
+            "[agent-guard] File path check: tool={}, path={}, resolved={}",
+            tool_name, file_path, resolved
+        );
+    }
+
+    // Use split_paths for OS-native parsing (`:` on Unix, `;` on Windows)
+    for prefix in std::env::split_paths(std::ffi::OsStr::new(allowed)) {
+        if prefix.as_os_str().is_empty() {
+            continue;
+        }
+        // Resolve the prefix too, so symlinks match (e.g., /tmp -> /private/tmp on macOS)
+        let resolved_prefix = resolve_path(&prefix.to_string_lossy());
+        // Use Path::starts_with for component-aware comparison, preventing
+        // prefix bypass (e.g., /tmp/safe matching /tmp/safevil)
+        if Path::new(&resolved).starts_with(Path::new(&resolved_prefix)) {
+            return None; // Path is within an allowed prefix
+        }
+    }
+
+    Some(DenyReason {
+        reason: format!(
+            "{} blocked: '{}' is outside the allowed workspace. Stay within your worktree.",
+            tool_name, file_path
+        ),
+    })
+}
+
+/// Resolve a file path to an absolute, canonical form.
+/// Handles symlinks and `..` components. Falls back to the raw path if resolution fails.
+///
+/// Walks up the path tree to find the deepest existing ancestor, canonicalizes it,
+/// then appends the remaining non-existent components. This ensures consistent
+/// resolution even when only part of the path exists (e.g., `/tmp` is a symlink
+/// to `/private/tmp` on macOS, but `/tmp/worktrees/myworktree` doesn't exist yet).
+fn resolve_path(path: &str) -> String {
+    let p = Path::new(path);
+
+    // Try full canonicalize first (entire path exists)
+    if let Ok(canonical) = p.canonicalize() {
+        return canonical.to_string_lossy().to_string();
+    }
+
+    // Walk up the path tree to find the deepest existing ancestor,
+    // then rebuild with remaining components.
+    let mut to_append = Vec::new();
+    let mut current = p.to_path_buf();
+
+    while let Some(name) = current.file_name() {
+        to_append.push(name.to_os_string());
+
+        let Some(parent) = current.parent() else {
+            break;
+        };
+
+        if let Ok(canonical) = parent.canonicalize() {
+            let mut result = canonical;
+            for component in to_append.iter().rev() {
+                result = result.join(component);
+            }
+            // Normalize away any remaining `..` components to prevent traversal
+            return normalize_path(&result).to_string_lossy().to_string();
+        }
+        current = parent.to_path_buf();
+    }
+
+    // Last resort: normalize and return (already absolute from Claude Code)
+    normalize_path(Path::new(path))
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Normalize a path by collapsing `.` and `..` components logically.
+/// Unlike `canonicalize`, this does not require the path to exist.
+fn normalize_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            _ => {
+                normalized.push(component);
+            }
+        }
+    }
+    normalized
 }
 
 // ── Input Parsing ───────────────────────────────────────
@@ -1227,5 +1432,188 @@ message = "medium priority"
         assert_eq!(patterns[0].priority, 200);
         assert_eq!(patterns[1].priority, 100);
         assert_eq!(patterns[2].priority, 50);
+    }
+
+    // ── File path sandboxing ────────────────────────────
+    //
+    // Tests use evaluate_file_path_with_allowed() to avoid env var races
+    // when tests run in parallel. Tests use Unix-style paths and are
+    // skipped on Windows where `/tmp/...` is not considered absolute.
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_allows_within_prefix() {
+        let allowed = std::env::join_paths(["/tmp/worktrees/test", "/tmp"])
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let allowed = allowed.as_str();
+        assert!(evaluate_file_path_with_allowed(
+            "Edit",
+            "/tmp/worktrees/test/src/main.rs",
+            allowed
+        )
+        .is_none());
+        assert!(evaluate_file_path_with_allowed("Write", "/tmp/somefile.txt", allowed).is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_denies_outside_prefix() {
+        let allowed = "/tmp/worktrees/test";
+        let result =
+            evaluate_file_path_with_allowed("Edit", "/Users/matt/real-repo/src/main.rs", allowed);
+        assert!(result.is_some());
+        assert!(result
+            .unwrap()
+            .reason
+            .contains("outside the allowed workspace"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_denies_read_outside() {
+        let allowed = "/tmp/worktrees/test";
+        let result =
+            evaluate_file_path_with_allowed("Read", "/Users/matt/real-repo/secrets.env", allowed);
+        assert!(result.is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_multiple_prefixes() {
+        let allowed = std::env::join_paths(["/tmp/worktrees/test", "/home/user/.kb", "/tmp"])
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let allowed = allowed.as_str();
+        assert!(evaluate_file_path_with_allowed(
+            "Write",
+            "/home/user/.kb/workspace/task.md",
+            allowed,
+        )
+        .is_none());
+        assert!(
+            evaluate_file_path_with_allowed("Edit", "/tmp/worktrees/test/code.rs", allowed)
+                .is_none()
+        );
+        let result =
+            evaluate_file_path_with_allowed("Edit", "/home/user/real-code/main.rs", allowed);
+        assert!(result.is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_denial_includes_tool_name() {
+        let allowed = "/tmp/allowed";
+        let result =
+            evaluate_file_path_with_allowed("NotebookEdit", "/forbidden/notebook.ipynb", allowed)
+                .unwrap();
+        assert!(result.reason.contains("NotebookEdit"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_denies_traversal_via_dotdot() {
+        let allowed = "/tmp/worktrees/test";
+        // Attempt to escape via .. in a non-existent path
+        let result = evaluate_file_path_with_allowed(
+            "Write",
+            "/tmp/worktrees/test/nonexistent/../../etc/passwd",
+            allowed,
+        );
+        assert!(result.is_some(), "path traversal via .. should be denied");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_denies_prefix_partial_match() {
+        let allowed = "/tmp/safe";
+        // /tmp/safevil should NOT match /tmp/safe
+        let result = evaluate_file_path_with_allowed("Edit", "/tmp/safevil/malicious.sh", allowed);
+        assert!(
+            result.is_some(),
+            "partial directory name match should be denied"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_denies_empty_path() {
+        let allowed = "/tmp/worktrees/test";
+        let result = evaluate_file_path_with_allowed("Edit", "", allowed);
+        assert!(result.is_some(), "empty path should be denied");
+        assert!(result.unwrap().reason.contains("must be absolute"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_denies_whitespace_only_path() {
+        let allowed = "/tmp/worktrees/test";
+        let result = evaluate_file_path_with_allowed("Write", "   ", allowed);
+        assert!(result.is_some(), "whitespace-only path should be denied");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_path_denies_relative_path() {
+        let allowed = "/tmp/worktrees/test";
+        let result = evaluate_file_path_with_allowed("Write", "../../etc/passwd", allowed);
+        assert!(result.is_some(), "relative path should be denied");
+        assert!(result.unwrap().reason.contains("must be absolute"));
+    }
+
+    // ── handle_guard with tool_name ─────────────────────
+
+    #[test]
+    fn parse_hook_input_with_tool_name() {
+        let input = r#"{"tool_name":"Edit","tool_input":{"file_path":"/tmp/test.rs"}}"#;
+        let hi: HookInput = serde_json::from_str(input).unwrap();
+        assert_eq!(hi.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(
+            hi.tool_input.as_ref().unwrap().file_path.as_deref(),
+            Some("/tmp/test.rs")
+        );
+    }
+
+    #[test]
+    fn parse_hook_input_with_notebook_path() {
+        let input =
+            r#"{"tool_name":"NotebookEdit","tool_input":{"notebook_path":"/tmp/nb.ipynb"}}"#;
+        let hi: HookInput = serde_json::from_str(input).unwrap();
+        assert_eq!(hi.tool_name.as_deref(), Some("NotebookEdit"));
+        assert_eq!(
+            hi.tool_input.as_ref().unwrap().notebook_path.as_deref(),
+            Some("/tmp/nb.ipynb")
+        );
+    }
+
+    #[test]
+    fn parse_hook_input_bash_still_works() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+        let hi: HookInput = serde_json::from_str(input).unwrap();
+        assert_eq!(hi.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(
+            hi.tool_input.as_ref().unwrap().command.as_deref(),
+            Some("git status")
+        );
+        assert!(hi.tool_input.as_ref().unwrap().file_path.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_path_handles_existing_paths() {
+        let resolved = resolve_path("/tmp");
+        assert!(resolved.starts_with('/'));
+        // On macOS, /tmp -> /private/tmp
+        assert!(resolved == "/tmp" || resolved == "/private/tmp");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_path_handles_nonexistent_files() {
+        let resolved = resolve_path("/tmp/nonexistent_guard_test_file.rs");
+        // Should resolve parent (/tmp or /private/tmp) + filename
+        assert!(resolved.ends_with("nonexistent_guard_test_file.rs"));
     }
 }
