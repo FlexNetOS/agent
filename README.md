@@ -7,7 +7,7 @@ A standalone CLI for Claude Code agent integration. Provides deterministic comma
 ## Installation
 
 ```bash
-cargo install --git https://github.com/gitkb/agent
+cargo install --git https://github.com/FlexNetOS/agent
 ```
 
 Or build from source:
