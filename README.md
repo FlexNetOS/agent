@@ -1,8 +1,8 @@
 # agent
 
-Claude Code agent toolkit: guard, score, and more.
+Claude Code and Codex agent toolkit: guard, score, Codex environment parity, and more.
 
-A standalone CLI for Claude Code agent integration. Provides deterministic command guards, session scoring, and other agent utilities.
+A standalone CLI for agent integration. Provides deterministic command guards, session scoring, Codex hook helpers, and other agent utilities.
 
 ## Installation
 
@@ -18,9 +18,36 @@ cargo build --release
 
 ## Commands
 
+### `agent codex inventory`
+
+Inventory the seven-layer Codex environment for the FlexNetOS meta workspace:
+
+1. Claude source surface
+2. Codex runtime config and hooks
+3. Codex repo skills
+4. Codex plugin marketplace
+5. Meta CLI and plugin commands
+6. Slash/hook/plugin/tool hubs
+7. Rust guard/inventory/stop tools
+
+```bash
+agent codex inventory
+agent --json codex inventory
+```
+
+### `agent codex stop`
+
+Codex `Stop` / `SubagentStop` hook command. It checks `meta git status --json`
+and blocks stopping when the workspace has pending repo changes and the last
+assistant message did not acknowledge workspace or cross-repo state.
+
+```bash
+agent codex stop
+```
+
 ### `agent guard`
 
-Evaluate a command for destructive patterns. Designed to run as a Claude Code PreToolUse hook.
+Evaluate a command for destructive patterns. Designed to run as a Claude Code or Codex PreToolUse hook.
 
 ```bash
 # Test directly

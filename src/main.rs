@@ -6,6 +6,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod codex;
 mod guard;
 mod score;
 
@@ -28,6 +29,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Codex environment parity tools for the meta workspace
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommands,
+    },
+
     /// Evaluate a command for destructive patterns (PreToolUse hook)
     Guard,
 
@@ -43,10 +50,23 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum CodexCommands {
+    /// Inventory the seven-layer Codex environment
+    Inventory,
+
+    /// Codex Stop/SubagentStop hook for meta workspace discipline
+    Stop,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Codex { command }) => match command {
+            CodexCommands::Inventory => codex::handle_inventory(cli.json),
+            CodexCommands::Stop => codex::handle_stop(),
+        },
         Some(Commands::Guard) => guard::handle_guard(),
         Some(Commands::Score { session, recent }) => {
             score::handle_score(session, recent, cli.json, cli.verbose)
@@ -57,6 +77,7 @@ fn main() -> Result<()> {
             eprintln!("Usage: agent <COMMAND>");
             eprintln!();
             eprintln!("Commands:");
+            eprintln!("  codex   Codex environment parity tools for the meta workspace");
             eprintln!("  guard   Evaluate a command for destructive patterns (PreToolUse hook)");
             eprintln!("  score   Score Claude Code sessions for agent effectiveness");
             eprintln!();
