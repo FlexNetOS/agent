@@ -55,6 +55,9 @@ enum CodexCommands {
     /// Inventory the seven-layer Codex environment
     Inventory,
 
+    /// Install repo prompt templates into ~/.codex/prompts for /prompts:* commands
+    InstallPrompts,
+
     /// Codex Stop/SubagentStop hook for meta workspace discipline
     Stop,
 }
@@ -65,6 +68,7 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Codex { command }) => match command {
             CodexCommands::Inventory => codex::handle_inventory(cli.json),
+            CodexCommands::InstallPrompts => codex::handle_install_prompts(),
             CodexCommands::Stop => codex::handle_stop(),
         },
         Some(Commands::Guard) => guard::handle_guard(),

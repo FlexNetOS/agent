@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
@@ -116,7 +117,7 @@ impl SessionFinder {
                 })
                 .collect();
 
-        files.sort_by(|a, b| b.1.cmp(&a.1)); // Newest first
+        files.sort_by_key(|file| Reverse(file.1)); // Newest first
         Ok(files.into_iter().take(n).map(|(p, _)| p).collect())
     }
 

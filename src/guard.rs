@@ -16,6 +16,7 @@
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -282,7 +283,7 @@ impl GuardConfig {
         }
 
         // Sort by priority (highest first)
-        compiled.sort_by(|a, b| b.priority.cmp(&a.priority));
+        compiled.sort_by_key(|rule| Reverse(rule.priority));
 
         compiled
     }

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const WORKSPACE_ACK_TERMS: &[&str] = &[
@@ -32,6 +32,7 @@ struct Layer {
     name: &'static str,
     status: &'static str,
     evidence: Vec<String>,
+    missing: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +112,21 @@ pub fn handle_stop() -> Result<()> {
     Ok(())
 }
 
+pub fn handle_install_prompts() -> Result<()> {
+    let root = std::env::current_dir().context("read current directory")?;
+    let source = root.join(".codex/prompts");
+    let dest = dirs::home_dir()
+        .context("resolve home directory")?
+        .join(".codex/prompts");
+
+    let installed = install_prompt_templates(&source, &dest)?;
+    for path in installed {
+        println!("{}", path.display());
+    }
+
+    Ok(())
+}
+
 impl StopInput {
     fn last_assistant_message(&self) -> &str {
         self.last_assistant_message_camel
@@ -123,72 +139,88 @@ impl StopInput {
 fn collect_inventory(root: &Path) -> Inventory {
     let mut missing = Vec::new();
 
-    let claude_evidence = existing(
+    let guidance = require_paths(
+        &mut missing,
         root,
+        "instructions/guidance/memory",
+        &["AGENTS.md", "CLAUDE.md", ".agent/skills-catalog.md"],
+    );
+
+    let runtime = require_paths(
+        &mut missing,
+        root,
+        "runtime config and custom agents",
+        &[".codex/config.toml", ".codex/agents/meta-worker.toml"],
+    );
+
+    let mut slash_prompts = require_paths(
+        &mut missing,
+        root,
+        "slash commands and prompt templates",
         &[
-            ".claude/settings.json",
-            ".claude/agent-guard.toml",
-            ".claude/skills",
-            ".claude/rules",
-            ".claude/agents",
-            "claude-plugin/skills",
+            ".codex/prompts/meta-status.md",
+            ".codex/prompts/meta-upgrade.md",
+            ".codex/prompts/meta-worker.md",
         ],
     );
-    require(&mut missing, &claude_evidence, "Claude source surface");
+    slash_prompts.extend(installed_prompt_evidence(&[
+        "meta-status.md",
+        "meta-upgrade.md",
+        "meta-worker.md",
+    ]));
 
-    let codex_runtime = existing(
+    let codex_skills = require_paths(
+        &mut missing,
         root,
+        "repo skills",
         &[
-            ".codex/config.toml",
-            ".codex/hooks.json",
-            ".codex/policies/strict-upgrade.md",
-            ".codex/rules/strict-upgrade.md",
+            ".agents/skills/gitkb/SKILL.md",
+            ".agents/skills/meta-exec/SKILL.md",
+            ".agents/skills/meta-git/SKILL.md",
+            ".agents/skills/meta-plugins/SKILL.md",
+            ".agents/skills/meta-safety/SKILL.md",
+            ".agents/skills/meta-slash-commands/SKILL.md",
+            ".agents/skills/meta-workspace/SKILL.md",
+            ".agents/skills/meta-worktree/SKILL.md",
         ],
     );
-    require(&mut missing, &codex_runtime, "Codex config/hooks");
 
-    let codex_skills = existing(root, &[".agents/skills"]);
-    require(&mut missing, &codex_skills, "Codex repo skills");
-
-    let codex_plugins = existing(
+    let codex_plugins = require_paths(
+        &mut missing,
         root,
+        "repo plugin marketplace",
         &[
             ".agents/plugins/marketplace.json",
             ".agents/plugins/plugins/meta-codex-rust-env/.codex-plugin/plugin.json",
+            ".agents/plugins/plugins/meta-codex-rust-env/skills/meta-codex-rust-env/SKILL.md",
+            ".agents/plugins/plugins/meta-codex-rust-env/hooks/hooks.json",
         ],
     );
-    require(
+
+    let hooks_rules = require_paths(
         &mut missing,
-        &codex_plugins,
-        "Codex repo plugin marketplace",
+        root,
+        "hooks/rules/permissions",
+        &[
+            ".codex/hooks.json",
+            ".codex/rules/strict-upgrade.rules",
+            ".codex/rules/strict-upgrade.md",
+            ".codex/policies/strict-upgrade.md",
+        ],
     );
 
-    let meta_cli = existing(
+    let tools_mcp = require_paths(
+        &mut missing,
         root,
+        "tools/mcp/subagents/automation",
         &[
-            "meta_cli",
-            "meta_git_cli",
-            "meta_project_cli",
-            "meta_rust_cli",
             "meta_mcp",
-            "meta-plugins/plugins",
+            "agent/src/main.rs",
+            "agent/src/codex.rs",
+            ".codex/config.toml",
+            ".codex/agents/meta-worker.toml",
         ],
     );
-    require(&mut missing, &meta_cli, "meta CLI/plugin repos");
-
-    let hubs = existing(
-        root,
-        &[
-            "commands/registry.json",
-            "hooks_hub/registry.json",
-            "plugin_hub/registry.json",
-            "tool_hub/registry.json",
-        ],
-    );
-    require(&mut missing, &hubs, "workspace hub registries");
-
-    let rust_tools = existing(root, &["agent/src/main.rs", "agent/src/codex.rs"]);
-    require(&mut missing, &rust_tools, "Rust Codex environment tooling");
 
     let hub_counts = HubCounts {
         commands: json_array_len(&root.join("commands/registry.json"), "commands"),
@@ -201,13 +233,13 @@ fn collect_inventory(root: &Path) -> Inventory {
     Inventory {
         root: root.display().to_string(),
         layers: vec![
-            layer("1. Claude Source Surface", &claude_evidence),
-            layer("2. Codex Runtime Config And Hooks", &codex_runtime),
-            layer("3. Codex Repo Skills", &codex_skills),
-            layer("4. Codex Plugin Marketplace", &codex_plugins),
-            layer("5. Meta CLI And Plugin Commands", &meta_cli),
-            layer("6. Slash/Hook/Plugin/Tool Hubs", &hubs),
-            layer("7. Rust Guard/Inventory/Stop Tools", &rust_tools),
+            layer("1. Instructions, Guidance, And Memory", &guidance),
+            layer("2. Runtime Config And Custom Agents", &runtime),
+            layer("3. Slash Commands And Prompt Templates", &slash_prompts),
+            layer("4. Repo Skills", &codex_skills),
+            layer("5. Plugins And Marketplace", &codex_plugins),
+            layer("6. Hooks, Rules, And Permissions", &hooks_rules),
+            layer("7. Tools, MCP, Subagents, And Automation", &tools_mcp),
         ],
         hub_counts,
         missing,
@@ -223,20 +255,25 @@ fn layer(name: &'static str, evidence: &[String]) -> Layer {
             "present"
         },
         evidence: evidence.to_vec(),
+        missing: Vec::new(),
     }
 }
 
-fn existing(root: &Path, rels: &[&str]) -> Vec<String> {
-    rels.iter()
-        .filter(|rel| root.join(rel).exists())
-        .map(|rel| (*rel).to_string())
-        .collect()
-}
-
-fn require(missing: &mut Vec<String>, evidence: &[String], name: &str) {
-    if evidence.is_empty() {
-        missing.push(name.to_string());
+fn require_paths(
+    missing: &mut Vec<String>,
+    root: &Path,
+    layer_name: &str,
+    rels: &[&str],
+) -> Vec<String> {
+    let mut evidence = Vec::new();
+    for rel in rels {
+        if root.join(rel).exists() {
+            evidence.push((*rel).to_string());
+        } else {
+            missing.push(format!("{layer_name}: {rel}"));
+        }
     }
+    evidence
 }
 
 fn json_array_len(path: &Path, key: &str) -> usize {
@@ -258,6 +295,40 @@ fn dir_entry_count(path: &Path) -> usize {
         return 0;
     };
     entries.filter_map(Result::ok).count()
+}
+
+fn installed_prompt_evidence(names: &[&str]) -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    names
+        .iter()
+        .filter_map(|name| {
+            let path = home.join(".codex/prompts").join(name);
+            path.exists().then(|| format!("~/.codex/prompts/{name}"))
+        })
+        .collect()
+}
+
+fn install_prompt_templates(source: &Path, dest: &Path) -> Result<Vec<PathBuf>> {
+    fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    let mut installed = Vec::new();
+
+    for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+
+        let target = dest.join(entry.file_name());
+        fs::copy(&path, &target)
+            .with_context(|| format!("copy {} to {}", path.display(), target.display()))?;
+        installed.push(target);
+    }
+
+    installed.sort();
+    Ok(installed)
 }
 
 fn parse_stop_input(input: &str) -> StopInput {
@@ -362,5 +433,39 @@ mod tests {
 
         let snake = parse_stop_input(r#"{"last_assistant_message":"cross-repo checked"}"#);
         assert_eq!(snake.last_assistant_message(), "cross-repo checked");
+    }
+
+    #[test]
+    fn require_paths_reports_each_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("present.txt"), "ok").unwrap();
+        let mut missing = Vec::new();
+
+        let evidence = require_paths(
+            &mut missing,
+            dir.path(),
+            "test layer",
+            &["present.txt", "missing.txt"],
+        );
+
+        assert_eq!(evidence, vec!["present.txt"]);
+        assert_eq!(missing, vec!["test layer: missing.txt"]);
+    }
+
+    #[test]
+    fn install_prompt_templates_copies_markdown_only() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("meta-status.md"), "prompt").unwrap();
+        fs::write(source.path().join("ignore.txt"), "no").unwrap();
+
+        let installed = install_prompt_templates(source.path(), dest.path()).unwrap();
+
+        assert_eq!(installed, vec![dest.path().join("meta-status.md")]);
+        assert_eq!(
+            fs::read_to_string(dest.path().join("meta-status.md")).unwrap(),
+            "prompt"
+        );
+        assert!(!dest.path().join("ignore.txt").exists());
     }
 }
