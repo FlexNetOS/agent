@@ -5,10 +5,13 @@
 //! JSON to block or allow execution. No LLM evaluation — pure pattern matching
 //! in Rust.
 //!
-//! Two modes:
+//! Three modes:
 //! - **Bash guard**: Evaluates Bash commands for destructive patterns (always active).
 //! - **File path sandbox**: When `AGENT_ALLOWED_PATHS` is set, restricts Edit/Write/Read/
 //!   NotebookEdit tools to allowed directory prefixes. Inactive in interactive mode.
+//! - **File-pattern rules**: Config-driven denial of file writes by basename pattern
+//!   (always active when `[[file_patterns]]` is configured) — e.g. deny NEW
+//!   handoff-style markdown outside `.handoff/` (ADR-0004 §1 / policy P7.36).
 //!
 //! Configuration is loaded from `.claude/agent-guard.toml` (project-level) or
 //! `~/.claude/agent-guard.toml` (user-level), with embedded defaults as fallback.
@@ -30,6 +33,10 @@ const DEFAULT_CONFIG: &str = include_str!("../.claude/agent-guard.toml");
 /// This avoids repeated file I/O, TOML parsing, and regex compilation.
 static CACHED_PATTERNS: OnceLock<Vec<CompiledPattern>> = OnceLock::new();
 
+/// Cached compiled file-pattern rules, loaded once per process (same lifecycle
+/// as `CACHED_PATTERNS`).
+static CACHED_FILE_PATTERNS: OnceLock<Vec<CompiledFilePattern>> = OnceLock::new();
+
 /// Agent guard configuration structure (versioned schema).
 /// Fields `schema_version` and `metadata` are deserialized for forward compat
 /// and future schema migration; only `patterns` is actively used today.
@@ -42,6 +49,8 @@ pub struct GuardConfig {
     pub metadata: Option<ConfigMetadata>,
     #[serde(default)]
     pub patterns: Vec<PatternDefinition>,
+    #[serde(default)]
+    pub file_patterns: Vec<FilePatternDefinition>,
 }
 
 /// Metadata about the configuration file (reserved for future tooling).
@@ -65,6 +74,46 @@ pub struct PatternDefinition {
     #[serde(default)]
     pub validator: Option<ValidatorConfig>,
     pub message: String,
+}
+
+/// File-pattern rule definition from configuration (`[[file_patterns]]`).
+///
+/// Denies Write/Edit-class tools when the target file's BASENAME matches
+/// `basename_regex`, unless an `allow_if_path_contains` substring appears in the
+/// resolved path. With `only_new_files` (default), existing files are
+/// grandfathered — only file creation is denied.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilePatternDefinition {
+    pub id: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_file_pattern_tools")]
+    pub applies_to: Vec<String>,
+    pub basename_regex: String,
+    #[serde(default)]
+    pub allow_if_path_contains: Vec<String>,
+    #[serde(default = "default_only_new_files")]
+    pub only_new_files: bool,
+    pub message: String,
+}
+
+fn default_file_pattern_tools() -> Vec<String> {
+    vec!["Write".to_string(), "Edit".to_string()]
+}
+
+fn default_only_new_files() -> bool {
+    true
+}
+
+/// Compiled file-pattern rule ready for evaluation.
+struct CompiledFilePattern {
+    #[allow(dead_code)]
+    id: String,
+    applies_to: Vec<String>,
+    regex: Regex,
+    allow_if_path_contains: Vec<String>,
+    only_new_files: bool,
+    message: String,
 }
 
 /// Matcher configuration (currently only regex, extensible for future types).
@@ -287,6 +336,39 @@ impl GuardConfig {
 
         compiled
     }
+
+    /// Compile file-pattern rules from configuration into regex matchers.
+    fn compile_file_patterns(self) -> Vec<CompiledFilePattern> {
+        let mut compiled = Vec::new();
+
+        for def in self.file_patterns {
+            if !def.enabled {
+                continue;
+            }
+
+            let regex = match Regex::new(&def.basename_regex) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "[agent-guard] WARNING: Failed to compile basename_regex for file pattern '{}': {}",
+                        def.id, e
+                    );
+                    continue;
+                }
+            };
+
+            compiled.push(CompiledFilePattern {
+                id: def.id,
+                applies_to: def.applies_to,
+                regex,
+                allow_if_path_contains: def.allow_if_path_contains,
+                only_new_files: def.only_new_files,
+                message: def.message,
+            });
+        }
+
+        compiled
+    }
 }
 
 // ── Public API ──────────────────────────────────────────
@@ -343,10 +425,22 @@ pub fn handle_guard() -> Result<()> {
                 ))?;
             }
         } else {
+            let mut denied = false;
             for fp in &paths {
                 if let Some(denial) = evaluate_file_path(tool_name, fp) {
                     emit_denial(denial.reason)?;
+                    denied = true;
                     break;
+                }
+            }
+            // File-pattern rules run after the sandbox; at most one denial JSON
+            // is ever emitted per invocation.
+            if !denied {
+                for fp in &paths {
+                    if let Some(denial) = evaluate_file_pattern(tool_name, fp) {
+                        emit_denial(denial.reason)?;
+                        break;
+                    }
                 }
             }
         }
@@ -418,6 +512,72 @@ fn emit_denial(reason: String) -> Result<()> {
     };
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
+}
+
+// ── File-Pattern Rules ──────────────────────────────────
+
+/// Evaluate a file path against configured `[[file_patterns]]` rules.
+/// Returns a DenyReason when a rule matches, None when the write is allowed.
+///
+/// Rules are loaded and compiled once, then cached for the process lifetime.
+pub fn evaluate_file_pattern(tool_name: &str, file_path: &str) -> Option<DenyReason> {
+    let patterns = CACHED_FILE_PATTERNS.get_or_init(|| {
+        let config = GuardConfig::load();
+        config.compile_file_patterns()
+    });
+    evaluate_file_pattern_with(tool_name, file_path, patterns)
+}
+
+/// Inner implementation that accepts compiled rules explicitly (testable without
+/// touching the process-wide cache).
+fn evaluate_file_pattern_with(
+    tool_name: &str,
+    file_path: &str,
+    patterns: &[CompiledFilePattern],
+) -> Option<DenyReason> {
+    if patterns.is_empty() {
+        return None;
+    }
+
+    // Resolve symlinks/`..` so allow-substrings and existence checks see the
+    // same path the filesystem will.
+    let resolved = resolve_path(file_path.trim());
+    let basename = Path::new(&resolved)
+        .file_name()?
+        .to_string_lossy()
+        .to_string();
+
+    for pattern in patterns {
+        if !pattern.applies_to.iter().any(|t| t == tool_name) {
+            continue;
+        }
+        if !pattern.regex.is_match(&basename) {
+            continue;
+        }
+        if pattern
+            .allow_if_path_contains
+            .iter()
+            .any(|s| !s.is_empty() && resolved.contains(s.as_str()))
+        {
+            continue;
+        }
+        if pattern.only_new_files && Path::new(&resolved).exists() {
+            continue; // Grandfathered: the file already exists.
+        }
+
+        if std::env::var("META_DEBUG_GUARD").is_ok() {
+            eprintln!(
+                "[agent-guard] File pattern '{}' triggered for: {} ({})",
+                pattern.id, resolved, tool_name
+            );
+        }
+
+        return Some(DenyReason {
+            reason: pattern.message.clone(),
+        });
+    }
+
+    None
 }
 
 // ── File Path Sandboxing ────────────────────────────────
@@ -1616,5 +1776,179 @@ message = "medium priority"
         let resolved = resolve_path("/tmp/nonexistent_guard_test_file.rs");
         // Should resolve parent (/tmp or /private/tmp) + filename
         assert!(resolved.ends_with("nonexistent_guard_test_file.rs"));
+    }
+
+    // ── File-pattern rules ─────────────────────────────
+
+    fn handoff_file_patterns() -> Vec<CompiledFilePattern> {
+        let toml = r#"
+schema_version = "1.0"
+
+[[file_patterns]]
+id = "meta.handoff.adhoc_handoff_md"
+enabled = true
+applies_to = ["Write", "Edit"]
+basename_regex = '^(?:[A-Z0-9_-]*HANDOFF[A-Z0-9_-]*|[A-Z0-9_-]+-PROMPT[A-Z0-9_-]*)\.md$'
+allow_if_path_contains = [".handoff/"]
+only_new_files = true
+message = "use the kernel (ADR-0004)"
+"#;
+        let config: GuardConfig = toml::from_str(toml).unwrap();
+        config.compile_file_patterns()
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_pattern_denies_new_handoff_md_outside_dotdir() {
+        let p = handoff_file_patterns();
+        for path in [
+            "/tmp/nonexistent-guard-test/SESSION-HANDOFF.md",
+            "/tmp/nonexistent-guard-test/FIX-MISSION-PROMPT.md",
+            "/tmp/nonexistent-guard-test/HANDOFF.md",
+            "/tmp/nonexistent-guard-test/NEXT-HANDOFF-2.md",
+        ] {
+            let result = evaluate_file_pattern_with("Write", path, &p);
+            assert!(result.is_some(), "{path} should be denied");
+            assert!(result.unwrap().reason.contains("ADR-0004"));
+        }
+        assert!(evaluate_file_pattern_with(
+            "Edit",
+            "/tmp/nonexistent-guard-test/UPGRADE-MISSION-PROMPT.md",
+            &p
+        )
+        .is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_pattern_allows_inside_dot_handoff() {
+        let p = handoff_file_patterns();
+        assert!(evaluate_file_pattern_with(
+            "Write",
+            "/tmp/nonexistent-guard-test/.handoff/packets/NEXT-SESSION-PROMPT.md",
+            &p
+        )
+        .is_none());
+        assert!(evaluate_file_pattern_with(
+            "Write",
+            "/tmp/nonexistent-guard-test/.handoff/loop/HANDOFF.md",
+            &p
+        )
+        .is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_pattern_allows_lowercase_names() {
+        let p = handoff_file_patterns();
+        assert!(evaluate_file_pattern_with(
+            "Write",
+            "/tmp/nonexistent-guard-test/session-handoff.md",
+            &p
+        )
+        .is_none());
+        assert!(evaluate_file_pattern_with(
+            "Write",
+            "/tmp/nonexistent-guard-test/system-prompt.md",
+            &p
+        )
+        .is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_pattern_grandfathers_existing_files() {
+        let p = handoff_file_patterns();
+        let dir = std::env::temp_dir().join("agent-guard-fp-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("LEGACY-HANDOFF.md");
+        std::fs::write(&f, "existing").unwrap();
+        assert!(
+            evaluate_file_pattern_with("Write", f.to_str().unwrap(), &p).is_none(),
+            "existing files are grandfathered"
+        );
+        std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn file_pattern_respects_applies_to() {
+        let p = handoff_file_patterns();
+        assert!(evaluate_file_pattern_with(
+            "Read",
+            "/tmp/nonexistent-guard-test/SESSION-HANDOFF.md",
+            &p
+        )
+        .is_none());
+        assert!(evaluate_file_pattern_with(
+            "NotebookEdit",
+            "/tmp/nonexistent-guard-test/SESSION-HANDOFF.md",
+            &p
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn file_pattern_defaults_apply() {
+        let toml = r#"
+schema_version = "1.0"
+
+[[file_patterns]]
+id = "t"
+basename_regex = 'X\.md$'
+message = "m"
+"#;
+        let config: GuardConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.file_patterns.len(), 1);
+        let def = &config.file_patterns[0];
+        assert!(def.enabled);
+        assert!(def.only_new_files);
+        assert_eq!(
+            def.applies_to,
+            vec!["Write".to_string(), "Edit".to_string()]
+        );
+        assert!(def.allow_if_path_contains.is_empty());
+    }
+
+    #[test]
+    fn config_without_file_patterns_still_parses() {
+        let toml = r#"
+schema_version = "1.0"
+
+[[patterns]]
+id = "meta.git.force_push"
+enabled = true
+matcher = { type = "regex", pattern = 'git\s+push.*--force' }
+message = "no"
+"#;
+        let config: GuardConfig = toml::from_str(toml).unwrap();
+        assert!(config.file_patterns.is_empty());
+        assert!(config.compile_file_patterns().is_empty());
+    }
+
+    #[test]
+    fn embedded_config_includes_handoff_file_pattern() {
+        let config = GuardConfig::load_from_embedded();
+        let ids: Vec<&str> = config.file_patterns.iter().map(|p| p.id.as_str()).collect();
+        assert!(ids.contains(&"meta.handoff.adhoc_handoff_md"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_pattern_disabled_rule_skipped() {
+        let toml = r#"
+schema_version = "1.0"
+
+[[file_patterns]]
+id = "t"
+enabled = false
+basename_regex = 'HANDOFF.*\.md$'
+message = "m"
+"#;
+        let config: GuardConfig = toml::from_str(toml).unwrap();
+        let p = config.compile_file_patterns();
+        assert!(
+            evaluate_file_pattern_with("Write", "/tmp/nonexistent-guard-test/HANDOFF.md", &p)
+                .is_none()
+        );
     }
 }

@@ -146,3 +146,27 @@ In a multi-repo workspace, this is especially dangerous. Safer alternatives:
 # enabled = true
 # matcher = { type = "regex", pattern = 'git\s+push.*\s+(--force|-f)\b(?!-with-lease)' }
 # message = "Our team policy: never force push to shared branches!"
+
+# ── File-pattern rules (guard schema 1.1) ──────────────────────────────────
+# Evaluated for Write/Edit PreToolUse hooks. Deny when the target file's
+# BASENAME matches `basename_regex`, the file does NOT yet exist
+# (only_new_files — existing files are grandfathered), and no
+# `allow_if_path_contains` substring appears in the resolved path.
+
+[[file_patterns]]
+id = "meta.handoff.adhoc_handoff_md"
+enabled = true
+applies_to = ["Write", "Edit"]
+basename_regex = '^(?:[A-Z0-9_-]*HANDOFF[A-Z0-9_-]*|[A-Z0-9_-]+-PROMPT[A-Z0-9_-]*)\.md$'
+allow_if_path_contains = [".handoff/"]
+only_new_files = true
+message = """
+Hand-written handoff/mission-prompt markdown outside .handoff/ is deprecated \
+(ADR-0004 §1, policy P7.36) — the kernel is the only handoff path. Instead:
+- /handoff  — checkpoint + render the next-session packet into .handoff/packets/
+- /mint     — turn a kb doc into a witnessed task card
+- /checkpoint <note> — witness progress into the fleet ledger
+Existing files stay editable (grandfathered). Rendered packets belong under \
+.handoff/. If this is genuinely not handoff state, rename it out of the \
+HANDOFF/-PROMPT namespace or adjust .claude/agent-guard.toml.
+"""
