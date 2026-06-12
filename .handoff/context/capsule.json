@@ -1,0 +1,10 @@
+{
+  "schema": "handoff.context_capsule.v1",
+  "project_name": "agent",
+  "role": "Standalone Rust CLI providing Claude Code/Codex harness hooks: `agent guard` (deterministic PreToolUse destructive-command denial with path sandboxing), `agent score` (session-effectiveness scoring), and `agent codex inventory/install-prompts/stop` (seven-layer Codex environment parity and Stop/SubagentStop workspace-discipline hook for the meta workspace). Wired into the parent meta repo as its guard hook.",
+  "plane": "harness",
+  "tier": "C",
+  "northstar": "Harnesses are upgrades on the foundation; Archon automates building them; never downgrade.",
+  "next_command": "Plan in kb first (git kb board); mint execution cards via hf (ADR-0003)",
+  "source": "ARCHITECTURE-TRUTH.md census 2026-06-12"
+}
