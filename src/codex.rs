@@ -1,16 +1,25 @@
 //! Codex environment parity helpers for the FlexNetOS meta workspace.
 
 use anyhow::{Context, Result};
+use clap::Args;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::fs;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const WORKSPACE_ACK_TERMS: &[&str] = &[
     "meta git status",
     "meta project list",
+    "agent codex exec",
+    "agent codex exec-status",
+    ".handoff/codex-exec",
+    "artifact log",
+    "capped tail",
     "cross-repo",
     "workspace state",
     "workspace-level",
@@ -18,6 +27,56 @@ const WORKSPACE_ACK_TERMS: &[&str] = &[
 ];
 
 const STOP_REASON: &str = "Meta workspace has pending repo changes. Run `meta git status`, confirm the touched repos and dependent repos, then include the cross-repo workspace scope in the handoff before stopping.";
+
+const DEFAULT_EXEC_ARTIFACT_DIR: &str = ".handoff/codex-exec";
+const DEFAULT_EXEC_TAIL_LINES: usize = 80;
+const MAX_EXEC_TAIL_LINES: usize = 200;
+
+#[derive(Args, Debug, Clone)]
+pub struct ExecArgs {
+    /// Short label used in the artifact directory name.
+    #[arg(long)]
+    pub label: Option<String>,
+
+    /// Start the command in the background and return the artifact paths immediately.
+    #[arg(long)]
+    pub background: bool,
+
+    /// Maximum log lines to print back into chat.
+    #[arg(long, default_value_t = DEFAULT_EXEC_TAIL_LINES)]
+    pub tail_lines: usize,
+
+    /// Directory for run artifacts. Relative paths are resolved under --cwd/current directory.
+    #[arg(long, default_value = DEFAULT_EXEC_ARTIFACT_DIR)]
+    pub artifact_dir: PathBuf,
+
+    /// Working directory for the command.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    /// Command and arguments to run. Use `--` before the command.
+    #[arg(required = true, trailing_var_arg = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ExecStatusArgs {
+    /// Run id to inspect. Defaults to the latest run in --artifact-dir.
+    #[arg(long)]
+    pub run_id: Option<String>,
+
+    /// Maximum log lines to print back into chat.
+    #[arg(long, default_value_t = DEFAULT_EXEC_TAIL_LINES)]
+    pub tail_lines: usize,
+
+    /// Directory for run artifacts. Relative paths are resolved under --cwd/current directory.
+    #[arg(long, default_value = DEFAULT_EXEC_ARTIFACT_DIR)]
+    pub artifact_dir: PathBuf,
+
+    /// Directory used to resolve relative --artifact-dir paths.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+}
 
 #[derive(Debug, Serialize)]
 struct Inventory {
@@ -57,6 +116,32 @@ struct StopInput {
 struct StopOutput<'a> {
     decision: &'a str,
     reason: &'a str,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExecMetadata {
+    run_id: String,
+    label: String,
+    cwd: String,
+    command: Vec<String>,
+    background: bool,
+    pid: Option<u32>,
+    log_path: String,
+    exit_code_path: String,
+    started_at_unix: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecSummary {
+    status: String,
+    run_id: String,
+    label: String,
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+    log_path: String,
+    status_command: String,
+    context_policy: &'static str,
+    tail_lines: usize,
 }
 
 pub fn handle_inventory(json: bool) -> Result<()> {
@@ -124,6 +209,121 @@ pub fn handle_install_prompts() -> Result<()> {
         println!("{}", path.display());
     }
 
+    Ok(())
+}
+
+pub fn handle_exec(args: ExecArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .unwrap_or(std::env::current_dir().context("read current directory")?);
+    let cwd = absolutize(&cwd).with_context(|| format!("resolve cwd {}", cwd.display()))?;
+    let artifact_root = resolve_artifact_root(&cwd, &args.artifact_dir);
+    let label = sanitize_label(args.label.as_deref().unwrap_or("codex-exec"));
+    let run_id = new_run_id(&label)?;
+    let run_dir = artifact_root.join(&run_id);
+    fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+
+    let log_path = run_dir.join("command.log");
+    let exit_code_path = run_dir.join("exit-code");
+    let script_path = run_dir.join("run.sh");
+    let latest_path = artifact_root.join("latest");
+    let tail_lines = capped_tail_lines(args.tail_lines);
+
+    let metadata = ExecMetadata {
+        run_id: run_id.clone(),
+        label: label.clone(),
+        cwd: cwd.display().to_string(),
+        command: args.command.clone(),
+        background: args.background,
+        pid: None,
+        log_path: log_path.display().to_string(),
+        exit_code_path: exit_code_path.display().to_string(),
+        started_at_unix: unix_timestamp()?,
+    };
+
+    write_metadata(&run_dir, &metadata)?;
+    fs::write(&latest_path, &run_id).with_context(|| format!("write {}", latest_path.display()))?;
+
+    if args.background {
+        write_background_script(&script_path, &cwd, &args.command, &exit_code_path)?;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("open {}", log_path.display()))?;
+        let err = log
+            .try_clone()
+            .with_context(|| format!("clone {}", log_path.display()))?;
+        let child = Command::new("bash")
+            .arg(&script_path)
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .with_context(|| format!("spawn background run {}", script_path.display()))?;
+        let metadata = ExecMetadata {
+            pid: Some(child.id()),
+            ..metadata
+        };
+        write_metadata(&run_dir, &metadata)?;
+        print_exec_summary(&metadata, "running", None, tail_lines);
+        return Ok(());
+    }
+
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open {}", log_path.display()))?;
+    let err = log
+        .try_clone()
+        .with_context(|| format!("clone {}", log_path.display()))?;
+    let mut command = Command::new(&args.command[0]);
+    command.args(&args.command[1..]).current_dir(&cwd);
+    let status = command
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .status()
+        .with_context(|| format!("spawn {}", args.command.join(" ")))?;
+    let code = status.code().unwrap_or(1);
+    fs::write(&exit_code_path, format!("{code}\n"))
+        .with_context(|| format!("write {}", exit_code_path.display()))?;
+    print_exec_summary(&metadata, "finished", Some(code), tail_lines);
+    print_capped_tail(&log_path, tail_lines)?;
+    if code != 0 {
+        anyhow::bail!(
+            "command exited with {code}; full log is at {}",
+            log_path.display()
+        );
+    }
+    Ok(())
+}
+
+pub fn handle_exec_status(args: ExecStatusArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .unwrap_or(std::env::current_dir().context("read current directory")?);
+    let cwd = absolutize(&cwd).with_context(|| format!("resolve cwd {}", cwd.display()))?;
+    let artifact_root = resolve_artifact_root(&cwd, &args.artifact_dir);
+    let run_id = match args.run_id {
+        Some(run_id) => run_id,
+        None => fs::read_to_string(artifact_root.join("latest"))
+            .with_context(|| format!("read {}", artifact_root.join("latest").display()))?
+            .trim()
+            .to_string(),
+    };
+    let run_dir = artifact_root.join(&run_id);
+    let metadata = read_metadata(&run_dir)?;
+    let exit_code = read_exit_code(Path::new(&metadata.exit_code_path))?;
+    let status = if exit_code.is_some() {
+        "finished"
+    } else if metadata.pid.is_some_and(pid_alive) {
+        "running"
+    } else {
+        "unknown"
+    };
+    let tail_lines = capped_tail_lines(args.tail_lines);
+    print_exec_summary(&metadata, status, exit_code, tail_lines);
+    print_capped_tail(Path::new(&metadata.log_path), tail_lines)?;
     Ok(())
 }
 
@@ -331,6 +531,172 @@ fn install_prompt_templates(source: &Path, dest: &Path) -> Result<Vec<PathBuf>> 
     Ok(installed)
 }
 
+fn absolutize(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn resolve_artifact_root(cwd: &Path, artifact_dir: &Path) -> PathBuf {
+    if artifact_dir.is_absolute() {
+        artifact_dir.to_path_buf()
+    } else {
+        cwd.join(artifact_dir)
+    }
+}
+
+fn capped_tail_lines(requested: usize) -> usize {
+    requested.min(MAX_EXEC_TAIL_LINES)
+}
+
+fn unix_timestamp() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before UNIX_EPOCH")?
+        .as_secs())
+}
+
+fn new_run_id(label: &str) -> Result<String> {
+    Ok(format!(
+        "{}-{}-{label}",
+        unix_timestamp()?,
+        std::process::id()
+    ))
+}
+
+fn sanitize_label(label: &str) -> String {
+    let mut out = String::new();
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch.is_whitespace() || ch == '.' || ch == '/' {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "codex-exec".to_string()
+    } else {
+        out.chars().take(48).collect()
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn write_background_script(
+    script_path: &Path,
+    cwd: &Path,
+    command: &[String],
+    exit_code_path: &Path,
+) -> Result<()> {
+    let command = command
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set +e
+cd {cwd}
+{command}
+code=$?
+printf '%s\n' "$code" > {exit_code}
+exit "$code"
+"#,
+        cwd = shell_quote(&cwd.display().to_string()),
+        command = command,
+        exit_code = shell_quote(&exit_code_path.display().to_string())
+    );
+    fs::write(script_path, script).with_context(|| format!("write {}", script_path.display()))?;
+    Ok(())
+}
+
+fn write_metadata(run_dir: &Path, metadata: &ExecMetadata) -> Result<()> {
+    fs::write(
+        run_dir.join("metadata.json"),
+        serde_json::to_string_pretty(metadata)?,
+    )
+    .with_context(|| format!("write {}", run_dir.join("metadata.json").display()))
+}
+
+fn read_metadata(run_dir: &Path) -> Result<ExecMetadata> {
+    let path = run_dir.join("metadata.json");
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+fn read_exit_code(path: &Path) -> Result<Option<i32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(text.trim().parse::<i32>().ok())
+}
+
+fn pid_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+fn print_exec_summary(
+    metadata: &ExecMetadata,
+    status: &str,
+    exit_code: Option<i32>,
+    tail_lines: usize,
+) {
+    let summary = ExecSummary {
+        status: status.to_string(),
+        run_id: metadata.run_id.clone(),
+        label: metadata.label.clone(),
+        pid: metadata.pid,
+        exit_code,
+        log_path: metadata.log_path.clone(),
+        status_command: format!("agent codex exec-status --run-id {}", metadata.run_id),
+        context_policy:
+            "Do not paste full logs into chat; inspect this artifact or request a capped tail.",
+        tail_lines,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).expect("serialize exec summary")
+    );
+}
+
+fn print_capped_tail(path: &Path, tail_lines: usize) -> Result<()> {
+    if tail_lines == 0 || !path.exists() {
+        return Ok(());
+    }
+    let tail = tail_file(path, tail_lines)?;
+    if tail.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "--- capped tail: {} (last {tail_lines} lines) ---",
+        path.display()
+    );
+    for line in tail {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn tail_file(path: &Path, tail_lines: usize) -> Result<Vec<String>> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut tail = VecDeque::with_capacity(tail_lines);
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        if tail.len() == tail_lines {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+    Ok(tail.into_iter().collect())
+}
+
 fn parse_stop_input(input: &str) -> StopInput {
     serde_json::from_str(input.trim()).unwrap_or_default()
 }
@@ -467,5 +833,36 @@ mod tests {
             "prompt"
         );
         assert!(!dest.path().join("ignore.txt").exists());
+    }
+
+    #[test]
+    fn sanitizes_exec_labels_for_artifact_paths() {
+        assert_eq!(sanitize_label("Envctl Check/Push"), "envctl-check-push");
+        assert_eq!(sanitize_label("!!!"), "codex-exec");
+    }
+
+    #[test]
+    fn shell_quotes_single_quotes() {
+        assert_eq!(shell_quote("it's ok"), "'it'\"'\"'s ok'");
+    }
+
+    #[test]
+    fn tail_file_returns_only_requested_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("command.log");
+        fs::write(&log, "one\ntwo\nthree\nfour\n").unwrap();
+
+        assert_eq!(
+            tail_file(&log, 2).unwrap(),
+            vec!["three".to_string(), "four".to_string()]
+        );
+    }
+
+    #[test]
+    fn stop_ack_accepts_artifact_based_capped_execution() {
+        assert!(!should_block_stop(
+            "Untracked files:\n\t.codex/hooks.json",
+            "Wrote meta git status scope to .handoff/codex-exec and surfaced a capped tail."
+        ));
     }
 }

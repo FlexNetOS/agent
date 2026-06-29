@@ -60,6 +60,12 @@ enum CodexCommands {
 
     /// Codex Stop/SubagentStop hook for meta workspace discipline
     Stop,
+
+    /// Run a command with full output captured to an artifact and only a capped tail printed
+    Exec(codex::ExecArgs),
+
+    /// Check a background/capped Codex exec artifact without dumping the full log
+    ExecStatus(codex::ExecStatusArgs),
 }
 
 fn main() -> Result<()> {
@@ -70,6 +76,8 @@ fn main() -> Result<()> {
             CodexCommands::Inventory => codex::handle_inventory(cli.json),
             CodexCommands::InstallPrompts => codex::handle_install_prompts(),
             CodexCommands::Stop => codex::handle_stop(),
+            CodexCommands::Exec(args) => codex::handle_exec(args),
+            CodexCommands::ExecStatus(args) => codex::handle_exec_status(args),
         },
         Some(Commands::Guard) => guard::handle_guard(),
         Some(Commands::Score { session, recent }) => {

@@ -45,6 +45,29 @@ assistant message did not acknowledge workspace or cross-repo state.
 agent codex stop
 ```
 
+### `agent codex exec`
+
+Compact-safe command runner for long Codex sessions. It writes full stdout/stderr
+to `.handoff/codex-exec/<run-id>/command.log` and only prints a JSON summary plus
+a capped tail. Use this instead of dumping long build, `meta git status`, process,
+or CI logs into chat.
+
+```bash
+# Foreground run: full log goes to an artifact; chat only gets the capped tail.
+agent codex exec --label envctl-check -- bash -lc 'cargo test -p envctl'
+
+# Background run: returns immediately with a run id and log path.
+agent codex exec --background --label pre-push -- bash -lc 'git push'
+
+# Poll later without pasting the whole log.
+agent codex exec-status --run-id <run-id>
+```
+
+Stop hooks are still the workspace-scope guardrail. Before stopping, use the
+artifact plus `meta git status`/`meta project list` evidence to summarize touched
+repos and dependent repos; do not paste full logs or uncapped status output into
+the active Codex context.
+
 ### `agent guard`
 
 Evaluate a command for destructive patterns. Designed to run as a Claude Code or Codex PreToolUse hook.

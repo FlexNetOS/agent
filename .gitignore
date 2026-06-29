@@ -1,4 +1,5 @@
 target/
+.handoff/codex-exec/
 
 # handoff continuity: binary ledger cache + migration artifacts are gitignored
 # (committed truth = .handoff/ledger.events.jsonl — ADR-0018 D1 / HFTASK-0067)
