@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "git-kb daemon status --quiet >/dev/null 2>&1 || git-kb daemon start --background >/dev/null 2>&1",
+            "command": "/home/flexnetos/FlexNetOS/usr/bin/git-kb daemon status --quiet >/dev/null 2>&1 || /home/flexnetos/FlexNetOS/usr/bin/git-kb daemon start --background >/dev/null 2>&1",
             "timeout": 10
           }
         ]
