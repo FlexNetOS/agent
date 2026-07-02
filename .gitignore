@@ -1,0 +1,8 @@
+# Rust
+/target/
+
+# GitKB
+.kb/.cache/
+.kb/store/
+.kb/workspace/
+.kb/workspaces/
