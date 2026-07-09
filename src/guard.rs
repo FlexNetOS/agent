@@ -282,7 +282,7 @@ impl GuardConfig {
         }
 
         // Sort by priority (highest first)
-        compiled.sort_by(|a, b| b.priority.cmp(&a.priority));
+        compiled.sort_by_key(|c| std::cmp::Reverse(c.priority));
 
         compiled
     }
