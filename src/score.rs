@@ -116,7 +116,7 @@ impl SessionFinder {
                 })
                 .collect();
 
-        files.sort_by(|a, b| b.1.cmp(&a.1)); // Newest first
+        files.sort_by_key(|f| std::cmp::Reverse(f.1)); // Newest first
         Ok(files.into_iter().take(n).map(|(p, _)| p).collect())
     }
 
