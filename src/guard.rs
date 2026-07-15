@@ -762,13 +762,81 @@ mod tests {
     }
 
     #[test]
-    fn allows_git_push_force_with_lease() {
-        assert!(evaluate_command("git push --force-with-lease origin main").is_none());
+    fn denies_git_push_force_with_lease_to_longlived() {
+        // ARCHBP-031 consolidated policy: long-lived branches are upgrade-only
+        // history — every force variant (including --force-with-lease) is denied.
+        assert!(evaluate_command("git push --force-with-lease origin main").is_some());
     }
 
     #[test]
-    fn allows_git_push_force_with_lease_equals() {
-        assert!(evaluate_command("git push --force-with-lease=main origin main").is_none());
+    fn denies_git_push_force_with_lease_equals_longlived() {
+        assert!(evaluate_command("git push --force-with-lease=main origin main").is_some());
+    }
+
+    #[test]
+    fn flags_git_push_force_with_lease_feature_branch() {
+        // Consolidated policy: escalate (ask), never silent allow.
+        assert!(evaluate_command("git push --force-with-lease origin task/foo").is_some());
+    }
+
+    #[test]
+    fn flags_git_push_refspec_force_feature_branch() {
+        assert!(evaluate_command("git push origin +task/foo").is_some());
+    }
+
+    #[test]
+    fn denies_git_push_refspec_force_longlived() {
+        assert!(evaluate_command("git push origin +main").is_some());
+    }
+
+    #[test]
+    fn denies_skip_permissions() {
+        assert!(evaluate_command("claude --dangerously-skip-permissions").is_some());
+    }
+
+    #[test]
+    fn denies_nested_claude_session() {
+        assert!(evaluate_command("rtk claude -p hi").is_some());
+    }
+
+    #[test]
+    fn allows_claude_version() {
+        assert!(evaluate_command("claude --version").is_none());
+    }
+
+    #[test]
+    fn denies_history_rewrite_filter_branch() {
+        assert!(evaluate_command("git filter-branch --all").is_some());
+    }
+
+    #[test]
+    fn denies_history_rewrite_reflog_expire() {
+        assert!(evaluate_command("git reflog expire --expire=now --all").is_some());
+    }
+
+    #[test]
+    fn denies_history_rewrite_gc_prune_now() {
+        assert!(evaluate_command("git gc --prune=now").is_some());
+    }
+
+    #[test]
+    fn embedded_defaults_contain_consolidated_rules() {
+        let config = GuardConfig::load_from_embedded();
+        let ids: Vec<&str> = config.patterns.iter().map(|p| p.id.as_str()).collect();
+        for id in [
+            "meta.claude.skip_permissions",
+            "meta.claude.nested_session",
+            "meta.git.force_push_longlived",
+            "meta.git.force_push_lease",
+            "meta.git.push_refspec_force",
+            "meta.git.branch_force_delete_longlived",
+            "meta.git.history_rewrite",
+        ] {
+            assert!(
+                ids.contains(&id),
+                "embedded defaults missing consolidated rule {id}"
+            );
+        }
     }
 
     #[test]
