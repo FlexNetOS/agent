@@ -30,10 +30,41 @@ setup() {
     [ -z "$output" ]
 }
 
-@test "guard allows git push --force-with-lease" {
+@test "guard denies git push --force-with-lease to long-lived branch" {
+    # ARCHBP-031 consolidated policy: long-lived branches are upgrade-only history.
     run bash -c 'echo '"'"'{"tool_input":{"command":"git push --force-with-lease origin main"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
+    [[ "$output" == *"deny"* ]]
+}
+
+@test "guard asks on git push --force-with-lease to feature branch" {
+    run bash -c 'echo '"'"'{"tool_input":{"command":"git push --force-with-lease origin task/foo"}}'"'"' | '"$AGENT_BIN"' guard'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"permissionDecision":"ask"'* ]]
+}
+
+@test "guard denies --dangerously-skip-permissions" {
+    run bash -c 'echo '"'"'{"tool_input":{"command":"claude --dangerously-skip-permissions"}}'"'"' | '"$AGENT_BIN"' guard'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"deny"* ]]
+}
+
+@test "guard denies nested claude session" {
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk claude -p hi"}}'"'"' | '"$AGENT_BIN"' guard'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"deny"* ]]
+}
+
+@test "guard allows claude --version" {
+    run bash -c 'echo '"'"'{"tool_input":{"command":"claude --version"}}'"'"' | '"$AGENT_BIN"' guard'
+    [ "$status" -eq 0 ]
     [ -z "$output" ]
+}
+
+@test "guard denies git filter-branch (history rewrite)" {
+    run bash -c 'echo '"'"'{"tool_input":{"command":"git filter-branch --all"}}'"'"' | '"$AGENT_BIN"' guard'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"deny"* ]]
 }
 
 @test "guard allows git reset --soft" {
