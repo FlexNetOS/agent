@@ -60,10 +60,46 @@ pub struct PatternDefinition {
     pub priority: u32,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Hook decision when the pattern fires: "deny" (block) or "ask" (escalate
+    /// to the operator). Unknown values fail closed to deny. Schema 1.1.
+    #[serde(default = "default_decision")]
+    pub decision: String,
     pub matcher: MatcherConfig,
     #[serde(default)]
     pub validator: Option<ValidatorConfig>,
     pub message: String,
+}
+
+/// Hook decision attached to a fired pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Deny,
+    Ask,
+}
+
+impl Decision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Decision::Deny => "deny",
+            Decision::Ask => "ask",
+        }
+    }
+
+    /// Parse a configured decision string. Fails closed: anything that is not
+    /// exactly "ask" is treated as deny.
+    fn parse(value: &str, pattern_id: &str) -> Decision {
+        match value {
+            "deny" => Decision::Deny,
+            "ask" => Decision::Ask,
+            other => {
+                eprintln!(
+                    "[agent-guard] WARNING: pattern '{}' has unknown decision '{}'; failing closed to deny",
+                    pattern_id, other
+                );
+                Decision::Deny
+            }
+        }
+    }
 }
 
 /// Matcher configuration (currently only regex, extensible for future types).
@@ -114,6 +150,7 @@ struct CompiledPattern {
     priority: u32,
     regex: Regex,
     message: String,
+    decision: Decision,
     validator: Option<ValidatorConfig>,
 }
 
@@ -127,6 +164,10 @@ fn default_priority() -> u32 {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_decision() -> String {
+    "deny".to_string()
 }
 
 // ── Validator Implementation ────────────────────────────
@@ -272,11 +313,14 @@ impl GuardConfig {
                 }
             };
 
+            let decision = Decision::parse(&pattern_def.decision, &pattern_def.id);
+
             compiled.push(CompiledPattern {
                 id: pattern_def.id,
                 priority: pattern_def.priority,
                 regex,
                 message: pattern_def.message,
+                decision,
                 validator: pattern_def.validator,
             });
         }
@@ -336,15 +380,18 @@ pub fn handle_guard() -> Result<()> {
             // When sandboxing is active, deny file-path tools with no path
             // to prevent bypass via malformed payloads
             if std::env::var_os("AGENT_ALLOWED_PATHS").is_some_and(|v| !v.is_empty()) {
-                emit_denial(format!(
-                    "{} blocked: no file path provided for sandboxed tool.",
-                    tool_name
-                ))?;
+                emit_denial(
+                    format!(
+                        "{} blocked: no file path provided for sandboxed tool.",
+                        tool_name
+                    ),
+                    Decision::Deny,
+                )?;
             }
         } else {
             for fp in &paths {
                 if let Some(denial) = evaluate_file_path(tool_name, fp) {
-                    emit_denial(denial.reason)?;
+                    emit_denial(denial.reason, denial.decision)?;
                     break;
                 }
             }
@@ -363,7 +410,7 @@ pub fn handle_guard() -> Result<()> {
     };
 
     if let Some(denial) = evaluate_command(&command) {
-        emit_denial(denial.reason)?;
+        emit_denial(denial.reason, denial.decision)?;
     }
 
     Ok(())
@@ -400,18 +447,20 @@ struct HookSpecificOutput {
     permission_decision_reason: String,
 }
 
-/// A denial reason returned when a destructive pattern is detected.
+/// A guard verdict returned when a destructive pattern is detected: the reason
+/// plus the configured hook decision (deny blocks, ask escalates).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenyReason {
     pub reason: String,
+    pub decision: Decision,
 }
 
-/// Emit a denial JSON response to stdout.
-fn emit_denial(reason: String) -> Result<()> {
+/// Emit a denial/escalation JSON response to stdout.
+fn emit_denial(reason: String, decision: Decision) -> Result<()> {
     let output = HookOutput {
         hook_specific_output: HookSpecificOutput {
             hook_event_name: "PreToolUse".to_string(),
-            permission_decision: "deny".to_string(),
+            permission_decision: decision.as_str().to_string(),
             permission_decision_reason: reason,
         },
     };
@@ -450,6 +499,7 @@ fn evaluate_file_path_with_allowed(
                 "{} blocked: path must be absolute, got '{}'.",
                 tool_name, file_path
             ),
+            decision: Decision::Deny,
         });
     }
 
@@ -484,6 +534,7 @@ fn evaluate_file_path_with_allowed(
             "{} blocked: '{}' is outside the allowed workspace. Stay within your worktree.",
             tool_name, file_path
         ),
+        decision: Decision::Deny,
     })
 }
 
@@ -612,6 +663,7 @@ fn evaluate_segment(segment: &str, patterns: &[CompiledPattern]) -> Option<DenyR
 
             return Some(DenyReason {
                 reason: pattern.message.clone(),
+                decision: pattern.decision,
             });
         }
     }
@@ -837,6 +889,82 @@ mod tests {
                 "embedded defaults missing consolidated rule {id}"
             );
         }
+    }
+
+    // ── decision semantics (schema 1.1) ─────────────────
+
+    #[test]
+    fn lease_feature_branch_is_ask() {
+        let d = evaluate_command("git push --force-with-lease origin task/foo").unwrap();
+        assert_eq!(d.decision, Decision::Ask);
+    }
+
+    #[test]
+    fn lease_longlived_is_deny() {
+        let d = evaluate_command("git push --force-with-lease origin main").unwrap();
+        assert_eq!(d.decision, Decision::Deny);
+    }
+
+    #[test]
+    fn refspec_force_feature_branch_is_ask() {
+        let d = evaluate_command("git push origin +task/foo").unwrap();
+        assert_eq!(d.decision, Decision::Ask);
+    }
+
+    #[test]
+    fn deny_rules_default_to_deny_decision() {
+        let d = evaluate_command("git reset --hard").unwrap();
+        assert_eq!(d.decision, Decision::Deny);
+    }
+
+    #[test]
+    fn ask_decision_parsed_from_config() {
+        let toml = r#"
+schema_version = "1.1"
+
+[[patterns]]
+id = "test.ask"
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = 'dangerzone' }
+message = "escalate"
+"#;
+        let config: GuardConfig = toml::from_str(toml).unwrap();
+        let patterns = config.compile_patterns();
+        let d = evaluate_segment("dangerzone now", &patterns).unwrap();
+        assert_eq!(d.decision, Decision::Ask);
+    }
+
+    #[test]
+    fn unknown_decision_fails_closed_to_deny() {
+        let toml = r#"
+schema_version = "1.1"
+
+[[patterns]]
+id = "test.unknown"
+enabled = true
+decision = "maybe"
+matcher = { type = "regex", pattern = 'dangerzone' }
+message = "??"
+"#;
+        let config: GuardConfig = toml::from_str(toml).unwrap();
+        let patterns = config.compile_patterns();
+        let d = evaluate_segment("dangerzone now", &patterns).unwrap();
+        assert_eq!(d.decision, Decision::Deny);
+    }
+
+    #[test]
+    fn hook_output_serializes_ask_decision() {
+        let output = HookOutput {
+            hook_specific_output: HookSpecificOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: Decision::Ask.as_str().to_string(),
+                permission_decision_reason: "escalate".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "ask");
     }
 
     #[test]
@@ -1330,7 +1458,7 @@ mod tests {
     #[test]
     fn config_loads_embedded_defaults() {
         let config = GuardConfig::load_from_embedded();
-        assert_eq!(config.schema_version, "1.0");
+        assert_eq!(config.schema_version, "1.1");
         assert!(!config.patterns.is_empty());
 
         // Verify all expected patterns are present
