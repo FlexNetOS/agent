@@ -47,3 +47,5 @@ pkg-url = "{ repo }/releases/download/v{ version }/agent-linux-arm64.tar.gz"
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/agent-windows-x64.zip"
 pkg-fmt = "zip"
+
+[workspace]

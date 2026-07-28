@@ -174,8 +174,8 @@ enum ContentBlock {
     },
     ToolResult {
         _tool_use_id: String,
-        _content: serde_json::Value,
-        _is_error: Option<bool>,
+        content: serde_json::Value,
+        is_error: Option<bool>,
     },
     #[serde(other)]
     Other,
@@ -205,7 +205,7 @@ pub struct SessionMetrics {
     pub commits_attempted: usize,
     pub meta_status_before_commit: Vec<usize>,
 
-    // Metric 5: Guard effectiveness (placeholder - requires hook logs)
+    // Metric 5: Guard effectiveness
     pub destructive_blocked: usize,
     pub destructive_allowed: usize,
 }
@@ -254,8 +254,8 @@ pub fn parse_and_score(transcript_path: &Path) -> Result<SessionMetrics> {
                 serde_json::from_value::<Vec<ContentBlock>>(message.content.clone())
             {
                 for content in content_array {
-                    if let ContentBlock::ToolUse { name, input, .. } = content {
-                        if name == "Bash" {
+                    match content {
+                        ContentBlock::ToolUse { name, input, .. } if name == "Bash" => {
                             call_rank += 1;
                             metrics.tool_calls += 1;
 
@@ -269,6 +269,12 @@ pub fn parse_and_score(transcript_path: &Path) -> Result<SessionMetrics> {
                                 );
                             }
                         }
+                        ContentBlock::ToolResult {
+                            content, is_error, ..
+                        } => {
+                            process_guard_output(&content, is_error.unwrap_or(false), &mut metrics);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -311,6 +317,7 @@ fn process_bash_command(
 
     if is_destructive {
         metrics.destructive_ops_detected += 1;
+        metrics.destructive_allowed += 1;
         // Check if there's a recent snapshot protecting this op
         if let Some(snapshot_rank) = last_snapshot_rank {
             if *snapshot_rank < rank && (rank - *snapshot_rank) <= 5 {
@@ -328,9 +335,6 @@ fn process_bash_command(
         metrics.commits_attempted += 1;
     }
 
-    // Metric 5: Guard effectiveness (placeholder - requires hook log parsing)
-    // This would need to parse hook denial messages from transcript, deferred for now
-
     metrics.bash_commands.push(BashCommand {
         rank,
         command: command.to_string(),
@@ -339,6 +343,45 @@ fn process_bash_command(
         is_destructive,
         timestamp,
     });
+}
+
+fn process_guard_output(content: &serde_json::Value, is_error: bool, metrics: &mut SessionMetrics) {
+    if guard_denied(content) || (is_error && content_mentions_guard(content)) {
+        metrics.destructive_blocked += 1;
+        if metrics.destructive_allowed > 0 {
+            metrics.destructive_allowed -= 1;
+        }
+    }
+}
+
+fn guard_denied(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(obj) => {
+            if obj.get("permissionDecision").and_then(|v| v.as_str()) == Some("deny") {
+                return true;
+            }
+            obj.values().any(guard_denied)
+        }
+        serde_json::Value::Array(values) => values.iter().any(guard_denied),
+        serde_json::Value::String(text) => {
+            text.contains("\"permissionDecision\":\"deny\"")
+                || text.contains("\"permissionDecision\": \"deny\"")
+        }
+        _ => false,
+    }
+}
+
+fn content_mentions_guard(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(obj) => obj.values().any(content_mentions_guard),
+        serde_json::Value::Array(values) => values.iter().any(content_mentions_guard),
+        serde_json::Value::String(text) => {
+            text.contains("permissionDecision")
+                || text.contains("blocked")
+                || text.contains("agent guard")
+        }
+        _ => false,
+    }
 }
 
 fn is_destructive_command(cmd: &str) -> bool {
@@ -466,7 +509,7 @@ pub fn compute_score(metrics: SessionMetrics) -> SessionScore {
     };
     let awareness_grade = Grade::from_score(awareness_score);
 
-    // Metric 5: Guard effectiveness (placeholder - requires hook logs)
+    // Metric 5: Guard effectiveness
     let guard_total = metrics.destructive_blocked + metrics.destructive_allowed;
     let guard_score = if guard_total > 0 {
         metrics.destructive_blocked as f64 / guard_total as f64
@@ -753,5 +796,80 @@ mod tests {
 
         assert_eq!(metrics.commits_attempted, 1);
         assert_eq!(metrics.meta_status_before_commit, vec![5]);
+    }
+
+    #[test]
+    fn test_guard_effectiveness_allowed_destructive_command() {
+        let mut metrics = SessionMetrics::default();
+        let mut last_snapshot = None;
+
+        process_bash_command(
+            "git reset --hard",
+            1,
+            "2026-01-27T00:00:00Z".to_string(),
+            &mut metrics,
+            &mut last_snapshot,
+        );
+
+        assert_eq!(metrics.destructive_allowed, 1);
+        assert_eq!(metrics.destructive_blocked, 0);
+    }
+
+    #[test]
+    fn test_guard_effectiveness_blocked_destructive_command() {
+        let mut metrics = SessionMetrics::default();
+        let mut last_snapshot = None;
+
+        process_bash_command(
+            "git push --force",
+            1,
+            "2026-01-27T00:00:00Z".to_string(),
+            &mut metrics,
+            &mut last_snapshot,
+        );
+        process_guard_output(
+            &serde_json::json!({
+                "hookSpecificOutput": {
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "blocked"
+                }
+            }),
+            false,
+            &mut metrics,
+        );
+
+        assert_eq!(metrics.destructive_allowed, 0);
+        assert_eq!(metrics.destructive_blocked, 1);
+    }
+
+    #[test]
+    fn test_guard_effectiveness_mixed_outcomes() {
+        let mut metrics = SessionMetrics::default();
+        let mut last_snapshot = None;
+
+        process_bash_command(
+            "git clean -fd",
+            1,
+            "2026-01-27T00:00:00Z".to_string(),
+            &mut metrics,
+            &mut last_snapshot,
+        );
+        process_guard_output(
+            &serde_json::Value::String(
+                r#"{"hookSpecificOutput":{"permissionDecision":"deny"}}"#.to_string(),
+            ),
+            false,
+            &mut metrics,
+        );
+        process_bash_command(
+            "rm -rf .",
+            2,
+            "2026-01-27T00:00:01Z".to_string(),
+            &mut metrics,
+            &mut last_snapshot,
+        );
+
+        assert_eq!(metrics.destructive_allowed, 1);
+        assert_eq!(metrics.destructive_blocked, 1);
     }
 }
