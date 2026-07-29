@@ -3,10 +3,31 @@
 # Integration tests for `agent guard`
 
 setup() {
-    AGENT_BIN="$BATS_TEST_DIRNAME/../target/debug/agent"
+    local manifest="$BATS_TEST_DIRNAME/../Cargo.toml"
 
-    if [ ! -f "$AGENT_BIN" ]; then
-        cargo build --manifest-path "$BATS_TEST_DIRNAME/../Cargo.toml" --quiet
+    # Ask cargo where it builds instead of assuming ./target. cargo honours
+    # CARGO_TARGET_DIR and .cargo/config.toml build.target-dir, and this
+    # workspace sets CARGO_TARGET_DIR outside the repo, so a hardcoded
+    # ../target/debug/agent never exists. The old setup() then compounded it:
+    # it ran `cargo build` on the miss but re-checked the same wrong path, so
+    # the build succeeded and every test still failed with
+    #   /bin/sh: 1: ./target/debug/agent: not found
+    local target_dir
+    target_dir="$(cargo metadata --no-deps --format-version 1 --manifest-path "$manifest" 2>/dev/null \
+        | jq -r '.target_directory // empty' 2>/dev/null)"
+    [ -n "$target_dir" ] || target_dir="${CARGO_TARGET_DIR:-$BATS_TEST_DIRNAME/../target}"
+
+    AGENT_BIN="$target_dir/debug/agent"
+
+    if [ ! -x "$AGENT_BIN" ]; then
+        cargo build --manifest-path "$manifest" --quiet
+    fi
+
+    # Fail loudly with the resolved path rather than letting each test report a
+    # bare "not found" from the shell.
+    if [ ! -x "$AGENT_BIN" ]; then
+        echo "agent binary not found after build: $AGENT_BIN" >&2
+        return 1
     fi
 }
 
