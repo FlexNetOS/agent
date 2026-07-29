@@ -1952,52 +1952,69 @@ message = "medium priority"
     }
 
     #[test]
-    fn path_law_covers_the_nushell_layer_surfaces() {
-        // The nushell layer sets ~57 env vars and is where this profile's paths
-        // are actually decided; mirroring only the upstream Rust surfaces left
-        // most of them unguarded.
+    fn path_law_covers_documented_surfaces() {
+        // Every name here is defined by an owner: upstream yazelix for the
+        // YZX_*/YAZELIX_* surfaces, POSIX convention for the editor/shell pair,
+        // the XDG spec for the rest.
         for pinned in [
             "export YZX_ZELLIJ=/nix/store/abc/bin/zellij",
+            "export YZX_YAZI_BIN=/some/bin/yazi",
             "export EDITOR=/usr/bin/vim",
             "export GIT_EDITOR=/usr/bin/vim",
             "export SHELL=/bin/bash",
             "export YAZELIX_HELIX_MANAGED_CONFIG_PATH=/some/config.toml",
-            "export YAZELIX_HOST_POLICY_ROOT=/some/policy",
             "export YAZELIX_NIX_STORE_ROOT=/some/store",
             "export LG_CONFIG_FILE=/some/lg.yml",
-            "export DENO_DIR=/some/deno",
-            "export npm_config_cache=/some/npm",
+            "export YAZELIX_STATE_DIR=/some/state",
+            "export XDG_CONFIG_HOME=/some/config",
             "export TMP=/some/tmp",
         ] {
             assert!(
                 evaluate_path_law(pinned).is_some(),
-                "nushell surface unguarded: {pinned}"
+                "documented surface unguarded: {pinned}"
             );
         }
     }
 
     #[test]
-    fn durable_caches_may_not_be_sent_to_the_volatile_root() {
-        // The nushell config layer draws this line explicitly: tmpfs is right
-        // for disposable caches, wrong for artifacts that are immutable and
-        // expensive to refetch, and wrong for starship's log dir.
-        for volatile in [
-            "export HF_HOME=/run/user/1001/yazelix/volatile/cache/hf",
+    fn path_law_does_not_encode_this_hosts_configuration() {
+        // The guard may encode a documented surface. It may NOT encode this
+        // machine's decision about where a surface points.
+        //
+        // Two rules were removed for breaking that: one denied five cache
+        // variables from resolving under the runtime dir, another required a
+        // dozen vendor caches to derive from XDG_CACHE_HOME. Both were read off
+        // the local nushell config layer — a file with no upstream counterpart —
+        // so the guard had started enforcing the drift it exists to prevent.
+        //
+        // Where a cache lives is configuration. It belongs to paths-doctor,
+        // which repairs state on one host, not to a policy that ships everywhere.
+        for local_policy in [
+            "export HF_HOME=/run/user/1001/hf",
             "export TORCH_HOME=$XDG_RUNTIME_DIR/torch",
             "export PLAYWRIGHT_BROWSERS_PATH=/run/user/1001/pw",
             "export STARSHIP_CACHE=/run/user/1001/starship",
             "export KACHE_CACHE_DIR=/run/user/1001/kache",
+            "export UV_CACHE_DIR=/some/uv",
+            "export npm_config_cache=/some/npm",
+            "export DENO_DIR=/some/deno",
         ] {
-            let denial =
-                evaluate_path_law(volatile).unwrap_or_else(|| panic!("uncaught: {volatile}"));
-            assert_eq!(denial.decision, Decision::Deny, "{volatile}");
+            assert!(
+                evaluate_path_law(local_policy).is_none(),
+                "guard is enforcing host configuration: {local_policy}"
+            );
         }
-        // The disposable ones are correct on the volatile root and must not deny.
-        assert_ne!(
-            evaluate_path_law("export UV_CACHE_DIR=$XDG_CACHE_HOME/uv")
-                .map(|d| d.decision)
-                .unwrap_or(Decision::Ask),
-            Decision::Deny
-        );
+    }
+
+    #[test]
+    fn path_rules_are_shape_based_not_location_based() {
+        // The test for whether a rule belongs: it must hold for any user at any
+        // uid, naming no directory this profile chose.
+        assert!(evaluate_path_law("/home/alice/.local/share/icm").is_some());
+        assert!(evaluate_path_law("/home/zed/.gemini").is_some());
+        assert!(evaluate_path_law("CARGO_TARGET_DIR=/run/user/7/t").is_some());
+        // ...while the same shapes under a workspace are ordinary paths.
+        assert!(evaluate_path_law("/home/alice/work/src/main.rs").is_none());
+        assert!(evaluate_path_law("/srv/build/target").is_none());
     }
 }

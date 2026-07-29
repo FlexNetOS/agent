@@ -235,39 +235,47 @@ non-scratch path.)
 """
 
 # ── path law ────────────────────────────────────────────────────────────────
-# Expressed against the SURFACES upstream yazelix defines, not against any
-# host's directories.
 #
-# Upstream's canonical resolver (crates/yzx-open/src/main.rs) is the reference
-# shape -- a precedence chain over surfaces, ending in a fallback:
+# SOURCING LAW, and the reason this section exists at all:
 #
-#   YAZELIX_STATE_DIR
-#     -> $XDG_DATA_HOME/yazelix
-#     -> $HOME/.local/share/yazelix
-#     -> env::temp_dir()/yazelix
+#   A rule may encode a DOCUMENTED SURFACE -- a variable whose owner defines it.
+#   Upstream yazelix owns YAZELIX_STATE_DIR and the YZX_* binary surfaces; the
+#   XDG spec owns XDG_CONFIG_HOME and XDG_RUNTIME_DIR; cargo owns CARGO_HOME;
+#   each agent owns its own home variable.
 #
-# Two things follow, and both are easy to get backwards.
+#   A rule may NEVER encode THIS HOST'S POLICY about where a surface points.
+#   That is not law, it is local configuration, and freezing it into a guard
+#   makes the configuration permanent by making it enforced.
 #
-# 1. ~/.local/share/yazelix is NOT forbidden. It is upstream's own documented
-#    last resort. Reaching it means no surface was set -- the repair is to set
-#    the surface, never to fight the path. These rules therefore cover the
-#    FlexNetOS-owned tools only, and leave upstream- and vendor-owned fallbacks
-#    alone.
+# Two rules were removed for violating exactly that. `durable_cache_on_volatile`
+# denied five cache variables from resolving under the runtime dir, and
+# `cache_surface_hardcoded` asserted twelve vendor caches must derive from
+# XDG_CACHE_HOME. Both were read off this machine's nushell config layer -- a
+# file that does not exist upstream -- so the guard had begun protecting the
+# drift it was written to stop. A census of the box is not a source of truth;
+# it is a description of the damage.
 #
-# 2. Empty is unset. Upstream reads through nonempty_env, so FOO="" falls
-#    through to the next surface rather than resolving to "". guard.rs matches
-#    that semantic when it resolves CLAUDE_CONFIG_DIR.
+# What remains is shape, not location. The rules below fire on the FORM of a
+# path -- a dotdir under a user home, build state on a runtime tmpfs, a store
+# path pinned by hash, a documented surface assigned a literal -- and none of
+# them names a directory this profile chose. They hold for any user, at any
+# uid, on any box, which is the test for whether a rule belongs here.
 #
-# The violation these patterns catch is "an absolute path was hardcoded where a
-# surface exists" -- host-agnostic, true for any user at any uid.
+# Upstream's resolver is the reference shape: a precedence chain over surfaces,
+# ending in a fallback (crates/yzx-open/src/main.rs, crates/yzx-config/src/paths.rs):
 #
-# Deliberately NOT a rule: "any absolute path under a user home". It fires on
-# ordinary workspace paths, and whether it fires depends on incidental quoting,
-# so the same class of path gets different answers. An unpredictable rule is
-# worse than no rule -- it teaches people to approve without reading.
+#   state   YAZELIX_STATE_DIR -> $XDG_DATA_HOME/yazelix
+#             -> $HOME/.local/share/yazelix -> env::temp_dir()/yazelix
+#   config  YAZELIX_CONFIG_HOME -> $XDG_CONFIG_HOME/yazelix
+#             -> $HOME/.config/yazelix
+#
+# Both terminal fallbacks are upstream-documented and MUST stay permitted.
+# Reaching one means no surface was set; the repair is to set the surface, never
+# to fight the path. Empty is unset -- upstream reads through nonempty_env.
 #
 # Division of labour: this policy is host-agnostic and denies the WRITE.
-# envctl's paths-doctor is host-specific and repairs the STATE.
+# envctl's paths-doctor is host-specific and repairs the STATE. A fact about
+# this machine belongs there, never here.
 
 [[patterns]]
 id = "paths.dotlocal_tool_state"
@@ -328,7 +336,7 @@ id = "paths.yazelix_surface_hardcoded"
 priority = 160
 enabled = true
 decision = "ask"
-matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_CACHE_HOME|XDG_RUNTIME_DIR|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME|ICM_DB|CARGO_HOME|CARGO_TARGET_DIR|TMPDIR|TMP|TEMP)\s*=\s*[\x27"]?/' }
+matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_CACHE_HOME|XDG_RUNTIME_DIR|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME|CARGO_HOME|CARGO_TARGET_DIR|TMPDIR|TMP|TEMP)\s*=\s*[\x27"]?/' }
 message = """
 This assigns a surface an absolute literal. Surfaces are what make upstream
 work for any user on any box, so pinning one to a path is how a host stops
@@ -405,7 +413,7 @@ id = "paths.binary_surface_hardcoded"
 priority = 160
 enabled = true
 decision = "ask"
-matcher = { type = "regex", pattern = '(YZX_ZELLIJ|YZX_YAZI_BIN|YZX_YA|YZX_EDITOR|YZX_MENU_YZX|YZX_OPEN_LOG|YAZELIX_AGENT_LAUNCHER|YAZELIX_PACKAGED_YAZI|RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER|YAZELIX_EDITOR|EDITOR|VISUAL|GIT_EDITOR|SHELL)\s*=\s*["\x27]?/' }
+matcher = { type = "regex", pattern = '(YZX_ZELLIJ|YZX_YAZI_BIN|YZX_YA|YZX_EDITOR|YZX_MENU_YZX|YZX_OPEN_LOG|YAZELIX_AGENT_LAUNCHER|YAZELIX_PACKAGED_YAZI|YAZELIX_EDITOR|EDITOR|VISUAL|GIT_EDITOR|SHELL)\s*=\s*["\x27]?/' }
 message = """
 This pins a BINARY surface to a path. Upstream locates its own tools through
 these, each set from a nix derivation, so pinning one to a literal detaches the
@@ -445,7 +453,7 @@ id = "paths.config_surface_hardcoded"
 priority = 160
 enabled = true
 decision = "ask"
-matcher = { type = "regex", pattern = '(YAZELIX_HELIX_MANAGED_CONFIG_PATH|YAZELIX_HELIX_BRIDGE|YAZELIX_HELIX_BRIDGE_ROOT|YAZELIX_HOST_POLICY_ROOT|YAZELIX_HOST_POLICY_TARGET_ROOT|YAZELIX_NIX_STORE_ROOT|HELIX_STEEL_CONFIG|LG_CONFIG_FILE)\s*=\s*["\x27]?/' }
+matcher = { type = "regex", pattern = '(YAZELIX_HELIX_MANAGED_CONFIG_PATH|YAZELIX_HELIX_BRIDGE|YAZELIX_NIX_STORE_ROOT|HELIX_STEEL_CONFIG|LG_CONFIG_FILE)\s*=\s*["\x27]?/' }
 message = """
 This pins a CONFIG surface to a path. The nushell layer sets these from the
 packaged runtime, and the managed-config surfaces in particular are rewritten on
@@ -457,42 +465,4 @@ every rebuild -- a literal here points at the previous generation's file.
 
 Read the surface. Approve inside the nushell or nix layer that legitimately
 produces the value.
-"""
-
-[[patterns]]
-id = "paths.durable_cache_on_volatile"
-priority = 200
-enabled = true
-decision = "deny"
-matcher = { type = "regex", pattern = '(HF_HOME|TORCH_HOME|PLAYWRIGHT_BROWSERS_PATH|STARSHIP_CACHE|KACHE_CACHE_DIR)\s*=\s*[^\s]*(/run/user/\d+|\$XDG_RUNTIME_DIR)' }
-message = """
-These caches must be DURABLE, and this points one at the volatile runtime root.
-
-The nushell config layer draws the line explicitly: volatile tmpfs is right for
-mutable session caches (npm, bun, uv, pip, go, gradle, deno, nix, cuda) but
-WRONG for artifacts that are immutable and expensive to refetch -- model weights
-(HF_HOME, TORCH_HOME) and browser binaries (PLAYWRIGHT_BROWSERS_PATH) -- and for
-starship's log dir, which must exist and be writable before XDG_CACHE_HOME is
-exported at all.
-
-Point these at the durable cache root. Sending them to tmpfs means a multi-GB
-re-download after every reboot, and in starship's case a broken early prompt.
-"""
-
-[[patterns]]
-id = "paths.cache_surface_hardcoded"
-priority = 140
-enabled = true
-decision = "ask"
-matcher = { type = "regex", pattern = '(NIX_CACHE_HOME|CUDA_CACHE_PATH|GRADLE_USER_HOME|DENO_DIR|UV_CACHE_DIR|PIP_CACHE_DIR|npm_config_cache|BUN_INSTALL_CACHE_DIR|YARN_CACHE_FOLDER|COREPACK_HOME|GOCACHE|GOMODCACHE)\s*=\s*["\x27]?/' }
-message = """
-This pins a CACHE surface to a path. The nushell config layer derives all of
-them from $XDG_CACHE_HOME so one decision moves the whole family, and pinning
-one detaches it from that decision.
-
-These are the genuinely disposable caches, so the volatile root is correct for
-them -- unlike the durable set (model weights, browser binaries, starship),
-which must survive a reboot.
-
-Derive from the surface: $XDG_CACHE_HOME/<name>.
 """
