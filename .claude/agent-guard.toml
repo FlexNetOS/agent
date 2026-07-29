@@ -328,7 +328,7 @@ id = "paths.yazelix_surface_hardcoded"
 priority = 160
 enabled = true
 decision = "ask"
-matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_CACHE_HOME|XDG_RUNTIME_DIR|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME|ICM_DB|CARGO_HOME|CARGO_TARGET_DIR|TMPDIR)\s*=\s*[\x27"]?/' }
+matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_CACHE_HOME|XDG_RUNTIME_DIR|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME|ICM_DB|CARGO_HOME|CARGO_TARGET_DIR|TMPDIR|TMP|TEMP)\s*=\s*[\x27"]?/' }
 message = """
 This assigns a surface an absolute literal. Surfaces are what make upstream
 work for any user on any box, so pinning one to a path is how a host stops
@@ -405,7 +405,7 @@ id = "paths.binary_surface_hardcoded"
 priority = 160
 enabled = true
 decision = "ask"
-matcher = { type = "regex", pattern = '(YZX_ZELLIJ|YZX_YAZI_BIN|YZX_YA|YZX_EDITOR|YZX_MENU_YZX|YZX_OPEN_LOG|YAZELIX_AGENT_LAUNCHER|YAZELIX_PACKAGED_YAZI|RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER)\s*=\s*["\x27]?/' }
+matcher = { type = "regex", pattern = '(YZX_ZELLIJ|YZX_YAZI_BIN|YZX_YA|YZX_EDITOR|YZX_MENU_YZX|YZX_OPEN_LOG|YAZELIX_AGENT_LAUNCHER|YAZELIX_PACKAGED_YAZI|RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER|YAZELIX_EDITOR|EDITOR|VISUAL|GIT_EDITOR|SHELL)\s*=\s*["\x27]?/' }
 message = """
 This pins a BINARY surface to a path. Upstream locates its own tools through
 these, each set from a nix derivation, so pinning one to a literal detaches the
@@ -438,4 +438,61 @@ honours $TMPDIR -- so even there /tmp is reached through the surface, never name
 
 Use $TMPDIR, or the session scratch directory when one is provided.
 Approve for genuinely throwaway inspection.
+"""
+
+[[patterns]]
+id = "paths.config_surface_hardcoded"
+priority = 160
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = '(YAZELIX_HELIX_MANAGED_CONFIG_PATH|YAZELIX_HELIX_BRIDGE|YAZELIX_HELIX_BRIDGE_ROOT|YAZELIX_HOST_POLICY_ROOT|YAZELIX_HOST_POLICY_TARGET_ROOT|YAZELIX_NIX_STORE_ROOT|HELIX_STEEL_CONFIG|LG_CONFIG_FILE)\s*=\s*["\x27]?/' }
+message = """
+This pins a CONFIG surface to a path. The nushell layer sets these from the
+packaged runtime, and the managed-config surfaces in particular are rewritten on
+every rebuild -- a literal here points at the previous generation's file.
+
+  YAZELIX_HELIX_MANAGED_CONFIG_PATH   YAZELIX_HELIX_BRIDGE
+  YAZELIX_HOST_POLICY_ROOT            YAZELIX_HOST_POLICY_TARGET_ROOT
+  HELIX_STEEL_CONFIG                  LG_CONFIG_FILE
+
+Read the surface. Approve inside the nushell or nix layer that legitimately
+produces the value.
+"""
+
+[[patterns]]
+id = "paths.durable_cache_on_volatile"
+priority = 200
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(HF_HOME|TORCH_HOME|PLAYWRIGHT_BROWSERS_PATH|STARSHIP_CACHE|KACHE_CACHE_DIR)\s*=\s*[^\s]*(/run/user/\d+|\$XDG_RUNTIME_DIR)' }
+message = """
+These caches must be DURABLE, and this points one at the volatile runtime root.
+
+The nushell config layer draws the line explicitly: volatile tmpfs is right for
+mutable session caches (npm, bun, uv, pip, go, gradle, deno, nix, cuda) but
+WRONG for artifacts that are immutable and expensive to refetch -- model weights
+(HF_HOME, TORCH_HOME) and browser binaries (PLAYWRIGHT_BROWSERS_PATH) -- and for
+starship's log dir, which must exist and be writable before XDG_CACHE_HOME is
+exported at all.
+
+Point these at the durable cache root. Sending them to tmpfs means a multi-GB
+re-download after every reboot, and in starship's case a broken early prompt.
+"""
+
+[[patterns]]
+id = "paths.cache_surface_hardcoded"
+priority = 140
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = '(NIX_CACHE_HOME|CUDA_CACHE_PATH|GRADLE_USER_HOME|DENO_DIR|UV_CACHE_DIR|PIP_CACHE_DIR|npm_config_cache|BUN_INSTALL_CACHE_DIR|YARN_CACHE_FOLDER|COREPACK_HOME|GOCACHE|GOMODCACHE)\s*=\s*["\x27]?/' }
+message = """
+This pins a CACHE surface to a path. The nushell config layer derives all of
+them from $XDG_CACHE_HOME so one decision moves the whole family, and pinning
+one detaches it from that decision.
+
+These are the genuinely disposable caches, so the volatile root is correct for
+them -- unlike the durable set (model weights, browser binaries, starship),
+which must survive a reboot.
+
+Derive from the surface: $XDG_CACHE_HOME/<name>.
 """

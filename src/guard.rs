@@ -1950,4 +1950,54 @@ message = "medium priority"
         }
         assert!(evaluate_path_law("echo mycodex").is_none());
     }
+
+    #[test]
+    fn path_law_covers_the_nushell_layer_surfaces() {
+        // The nushell layer sets ~57 env vars and is where this profile's paths
+        // are actually decided; mirroring only the upstream Rust surfaces left
+        // most of them unguarded.
+        for pinned in [
+            "export YZX_ZELLIJ=/nix/store/abc/bin/zellij",
+            "export EDITOR=/usr/bin/vim",
+            "export GIT_EDITOR=/usr/bin/vim",
+            "export SHELL=/bin/bash",
+            "export YAZELIX_HELIX_MANAGED_CONFIG_PATH=/some/config.toml",
+            "export YAZELIX_HOST_POLICY_ROOT=/some/policy",
+            "export YAZELIX_NIX_STORE_ROOT=/some/store",
+            "export LG_CONFIG_FILE=/some/lg.yml",
+            "export DENO_DIR=/some/deno",
+            "export npm_config_cache=/some/npm",
+            "export TMP=/some/tmp",
+        ] {
+            assert!(
+                evaluate_path_law(pinned).is_some(),
+                "nushell surface unguarded: {pinned}"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_caches_may_not_be_sent_to_the_volatile_root() {
+        // The nushell config layer draws this line explicitly: tmpfs is right
+        // for disposable caches, wrong for artifacts that are immutable and
+        // expensive to refetch, and wrong for starship's log dir.
+        for volatile in [
+            "export HF_HOME=/run/user/1001/yazelix/volatile/cache/hf",
+            "export TORCH_HOME=$XDG_RUNTIME_DIR/torch",
+            "export PLAYWRIGHT_BROWSERS_PATH=/run/user/1001/pw",
+            "export STARSHIP_CACHE=/run/user/1001/starship",
+            "export KACHE_CACHE_DIR=/run/user/1001/kache",
+        ] {
+            let denial =
+                evaluate_path_law(volatile).unwrap_or_else(|| panic!("uncaught: {volatile}"));
+            assert_eq!(denial.decision, Decision::Deny, "{volatile}");
+        }
+        // The disposable ones are correct on the volatile root and must not deny.
+        assert_ne!(
+            evaluate_path_law("export UV_CACHE_DIR=$XDG_CACHE_HOME/uv")
+                .map(|d| d.decision)
+                .unwrap_or(Decision::Ask),
+            Decision::Deny
+        );
+    }
 }
