@@ -336,7 +336,7 @@ id = "paths.yazelix_surface_hardcoded"
 priority = 160
 enabled = true
 decision = "ask"
-matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_CACHE_HOME|XDG_RUNTIME_DIR|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME|CARGO_HOME|CARGO_TARGET_DIR|TMPDIR|TMP|TEMP)\s*=\s*[\x27"]?/' }
+matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_CACHE_HOME|XDG_RUNTIME_DIR|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME|CARGO_HOME|CARGO_TARGET_DIR|TMPDIR)\s*=\s*[\x27"]?/' }
 message = """
 This assigns a surface an absolute literal. Surfaces are what make upstream
 work for any user on any box, so pinning one to a path is how a host stops

@@ -416,11 +416,20 @@ pub fn handle_guard() -> Result<()> {
         // mentions `rm -rf` or `git reset --hard`.
         if matches!(tool_name, "Edit" | "Write" | "NotebookEdit") {
             if let Some(ti) = hook_input.tool_input.as_ref() {
-                let payload = [ti.content.as_deref(), ti.new_string.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                // The destination counts too: writing into a competing agent
+                // home, or into yazelix's packaged layer instead of its
+                // documented user config, is a path violation regardless of
+                // what the file happens to contain.
+                let payload = [
+                    ti.file_path.as_deref(),
+                    ti.notebook_path.as_deref(),
+                    ti.content.as_deref(),
+                    ti.new_string.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n");
                 if !payload.is_empty() {
                     if let Some(denial) = evaluate_path_law(&payload) {
                         emit_denial(denial.reason, denial.decision)?;
@@ -1967,7 +1976,7 @@ message = "medium priority"
             "export LG_CONFIG_FILE=/some/lg.yml",
             "export YAZELIX_STATE_DIR=/some/state",
             "export XDG_CONFIG_HOME=/some/config",
-            "export TMP=/some/tmp",
+            "export TMPDIR=/some/tmp",
         ] {
             assert!(
                 evaluate_path_law(pinned).is_some(),
