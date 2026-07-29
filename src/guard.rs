@@ -400,7 +400,31 @@ pub fn handle_guard() -> Result<()> {
             for fp in &paths {
                 if let Some(denial) = evaluate_file_path(tool_name, fp) {
                     emit_denial(denial.reason, denial.decision)?;
-                    break;
+                    return Ok(());
+                }
+            }
+        }
+
+        // The allowlist above answers "may this tool touch that file". It does
+        // not answer "is a forbidden path being written into it" — so without
+        // the check below, every path rule was bypassable by writing a file
+        // instead of running a command, which is how a hardcoded agent home or
+        // an off-surface state dir actually enters a repo.
+        //
+        // Only the path rules apply here. Running the destructive-command rules
+        // over file content would deny writing documentation that merely
+        // mentions `rm -rf` or `git reset --hard`.
+        if matches!(tool_name, "Edit" | "Write" | "NotebookEdit") {
+            if let Some(ti) = hook_input.tool_input.as_ref() {
+                let payload = [ti.content.as_deref(), ti.new_string.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !payload.is_empty() {
+                    if let Some(denial) = evaluate_path_law(&payload) {
+                        emit_denial(denial.reason, denial.decision)?;
+                    }
                 }
             }
         }
@@ -437,6 +461,11 @@ struct ToolInput {
     command: Option<String>,
     file_path: Option<String>,
     notebook_path: Option<String>,
+    /// Write payload; scanned by the path-law rules so a forbidden path cannot
+    /// be introduced by writing a file instead of running a command.
+    content: Option<String>,
+    /// Edit payload, same reason.
+    new_string: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -632,6 +661,31 @@ fn parse_command(input: &str) -> Option<String> {
 /// Returns a DenyReason if the command should be blocked, None if safe.
 ///
 /// Patterns are loaded and compiled once, then cached for the lifetime of the process.
+/// Evaluate text against the path-law rules only (`paths.*`).
+///
+/// Used for file payloads, where the destructive-command rules must not apply:
+/// a document describing `rm -rf` is not an `rm -rf`. Path rules are different
+/// in kind — a forbidden path written into a file is a forbidden path,
+/// whichever tool put it there.
+///
+/// Unlike command evaluation there is no compound-command splitting; the
+/// payload is matched whole, so a rule cannot be evaded by line layout.
+pub fn evaluate_path_law(text: &str) -> Option<DenyReason> {
+    let patterns = CACHED_PATTERNS.get_or_init(|| {
+        let config = GuardConfig::load();
+        config.compile_patterns()
+    });
+
+    patterns
+        .iter()
+        .filter(|p| p.id.starts_with("paths."))
+        .find(|p| p.regex.is_match(text))
+        .map(|p| DenyReason {
+            reason: p.message.clone(),
+            decision: p.decision,
+        })
+}
+
 pub fn evaluate_command(command: &str) -> Option<DenyReason> {
     let patterns = CACHED_PATTERNS.get_or_init(|| {
         let config = GuardConfig::load();
@@ -1819,5 +1873,81 @@ message = "medium priority"
         let resolved = resolve_path("/tmp/nonexistent_guard_test_file.rs");
         // Should resolve parent (/tmp or /private/tmp) + filename
         assert!(resolved.ends_with("nonexistent_guard_test_file.rs"));
+    }
+
+    // ── path law over written content ───────────────────────────────────────
+    //
+    // The allowlist answers "may this tool touch that file". It does not answer
+    // "is a forbidden path being written into it", so every path rule used to be
+    // bypassable by writing a file instead of running a command.
+
+    #[test]
+    fn path_law_denies_a_competing_agent_home_in_written_content() {
+        let denial = evaluate_path_law("let codex_home = \"/home/someone/.codex\"")
+            .expect("a competing agent home in file content must be caught");
+        assert_eq!(denial.decision, Decision::Deny);
+    }
+
+    #[test]
+    fn path_law_denies_off_surface_tool_state_in_written_content() {
+        assert!(evaluate_path_law("mkdir -p /home/someone/.local/share/icm").is_some());
+        assert!(evaluate_path_law("cfg = '/home/someone/.config/weave'").is_some());
+    }
+
+    #[test]
+    fn path_law_ignores_destructive_command_rules() {
+        // A document describing `rm -rf` is not an `rm -rf`. Only `paths.*`
+        // rules apply to file payloads; mixing the two would make ordinary
+        // documentation unwritable.
+        assert!(evaluate_path_law("Never run rm -rf / on this box.").is_none());
+        assert!(evaluate_path_law("Avoid git reset --hard; use snapshots.").is_none());
+    }
+
+    #[test]
+    fn path_law_permits_upstream_documented_fallbacks() {
+        // Upstream's own resolution chains end in these. Denying them would put
+        // the policy in conflict with the tool it is meant to protect:
+        //   state  YAZELIX_STATE_DIR -> $XDG_DATA_HOME/yazelix -> ~/.local/share/yazelix
+        //   config YAZELIX_CONFIG_HOME -> $XDG_CONFIG_HOME/yazelix -> ~/.config/yazelix
+        assert!(evaluate_path_law("falls back to $HOME/.local/share/yazelix").is_none());
+        assert!(evaluate_path_law("falls back to $HOME/.config/yazelix").is_none());
+    }
+
+    #[test]
+    fn path_law_is_host_agnostic() {
+        // The rules key on shape, not on one machine's directories, so they hold
+        // for any user at any uid.
+        assert!(evaluate_path_law("/home/alice/.local/share/rtk").is_some());
+        assert!(evaluate_path_law("/home/bob/.gemini").is_some());
+        assert!(evaluate_path_law("CARGO_TARGET_DIR=/run/user/4242/t").is_some());
+    }
+
+    #[test]
+    fn path_law_does_not_overmatch_ordinary_paths() {
+        assert!(evaluate_path_law("let x = 1").is_none());
+        assert!(evaluate_path_law("/home/someone/projects/notes.md").is_none());
+        assert!(evaluate_path_law("/home/someone/meta/var/lib/codex").is_none());
+    }
+
+    #[test]
+    fn agent_home_rule_survives_quoting() {
+        // A closing quote once escaped this rule's trailing anchor, so every
+        // delimiter that can legally follow a path is covered.
+        for form in [
+            "ls /home/someone/.codex",
+            "ls \"/home/someone/.codex\"",
+            "ls '/home/someone/.codex'",
+            "ls /home/someone/.codex/sessions",
+            "echo /home/someone/.claude",
+            "cp a /home/someone/.gemini, b",
+            "ls ~/.copilot",
+            "ls $HOME/.codex",
+        ] {
+            assert!(
+                evaluate_path_law(form).is_some(),
+                "agent-home rule missed: {form}"
+            );
+        }
+        assert!(evaluate_path_law("echo mycodex").is_none());
     }
 }

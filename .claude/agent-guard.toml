@@ -328,7 +328,7 @@ id = "paths.yazelix_surface_hardcoded"
 priority = 160
 enabled = true
 decision = "ask"
-matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME)\s*=\s*[\x27"]?/' }
+matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_CACHE_HOME|XDG_RUNTIME_DIR|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME|ICM_DB|CARGO_HOME|CARGO_TARGET_DIR|TMPDIR)\s*=\s*[\x27"]?/' }
 message = """
 This assigns a surface an absolute literal. Surfaces are what make upstream
 work for any user on any box, so pinning one to a path is how a host stops
@@ -398,4 +398,44 @@ Working example -- packaging/icm_release.nix:
 If a raw `cargo build` fails on a -sys crate, build it through nix, or use the
 CI devshell that already carries pkg-config:
   nix develop path:<yazelix>#ci
+"""
+
+[[patterns]]
+id = "paths.binary_surface_hardcoded"
+priority = 160
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = '(YZX_ZELLIJ|YZX_YAZI_BIN|YZX_YA|YZX_EDITOR|YZX_MENU_YZX|YZX_OPEN_LOG|YAZELIX_AGENT_LAUNCHER|YAZELIX_PACKAGED_YAZI|RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER)\s*=\s*["\x27]?/' }
+message = """
+This pins a BINARY surface to a path. Upstream locates its own tools through
+these, each set from a nix derivation, so pinning one to a literal detaches the
+tool from the closure that built it and outlives the rebuild that moved it.
+
+  YZX_ZELLIJ  YZX_YAZI_BIN  YZX_YA  YZX_EDITOR  YZX_MENU_YZX  YZX_OPEN_LOG
+  YAZELIX_AGENT_LAUNCHER  YAZELIX_PACKAGED_YAZI
+
+Upstream reads them with a fallback to the bare command name, e.g.
+  zellij: nonempty_env("YZX_ZELLIJ").unwrap_or_else(|| "zellij".into())
+so an unset surface is a supported state -- resolution falls back to PATH, which
+the profile owns. Read the surface; let nix set it.
+
+Approve inside a nix expression that is legitimately producing the value.
+"""
+
+[[patterns]]
+id = "paths.tmpdir_hardcoded"
+priority = 140
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = '(^|["\x27=\s])/tmp/[A-Za-z0-9._-]' }
+message = """
+This writes to /tmp directly. $TMPDIR is the surface, and this profile points it
+at the session-volatile root so scratch files are cleaned with the session
+instead of accumulating in a shared world-writable directory.
+
+Upstream's own last-resort state fallback is env::temp_dir()/yazelix, which
+honours $TMPDIR -- so even there /tmp is reached through the surface, never named.
+
+Use $TMPDIR, or the session scratch directory when one is provided.
+Approve for genuinely throwaway inspection.
 """
