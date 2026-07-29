@@ -233,3 +233,169 @@ LAW 1: never delete, always archive. Safer alternatives:
 (guard-bash.sh additionally enforces envctl.rm.archive_first for any
 non-scratch path.)
 """
+
+# ── path law ────────────────────────────────────────────────────────────────
+# Expressed against the SURFACES upstream yazelix defines, not against any
+# host's directories.
+#
+# Upstream's canonical resolver (crates/yzx-open/src/main.rs) is the reference
+# shape -- a precedence chain over surfaces, ending in a fallback:
+#
+#   YAZELIX_STATE_DIR
+#     -> $XDG_DATA_HOME/yazelix
+#     -> $HOME/.local/share/yazelix
+#     -> env::temp_dir()/yazelix
+#
+# Two things follow, and both are easy to get backwards.
+#
+# 1. ~/.local/share/yazelix is NOT forbidden. It is upstream's own documented
+#    last resort. Reaching it means no surface was set -- the repair is to set
+#    the surface, never to fight the path. These rules therefore cover the
+#    FlexNetOS-owned tools only, and leave upstream- and vendor-owned fallbacks
+#    alone.
+#
+# 2. Empty is unset. Upstream reads through nonempty_env, so FOO="" falls
+#    through to the next surface rather than resolving to "". guard.rs matches
+#    that semantic when it resolves CLAUDE_CONFIG_DIR.
+#
+# The violation these patterns catch is "an absolute path was hardcoded where a
+# surface exists" -- host-agnostic, true for any user at any uid.
+#
+# Deliberately NOT a rule: "any absolute path under a user home". It fires on
+# ordinary workspace paths, and whether it fires depends on incidental quoting,
+# so the same class of path gets different answers. An unpredictable rule is
+# worse than no rule -- it teaches people to approve without reading.
+#
+# Division of labour: this policy is host-agnostic and denies the WRITE.
+# envctl's paths-doctor is host-specific and repairs the STATE.
+
+[[patterns]]
+id = "paths.dotlocal_tool_state"
+priority = 200
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(/home/[^/\s]+|\$HOME|~)/\.(local/(share|state)|config)/(icm|rtk|weave|atc|env-ctl|ccboard)' }
+message = """
+FlexNetOS tool state is reached through the XDG surface, never by naming a path
+under the user home.
+  data   -> $XDG_DATA_HOME/<tool>
+  state  -> $XDG_STATE_HOME/<tool>
+Both are exported by the profile frontdoor, so the tool's own XDG resolution
+finds them with no path in your command at all.
+
+If a tool is landing under ~/.local anyway, its surface is unset in that
+process -- fix the surface, not the path. Note that XDG_CONFIG_HOME is
+deliberately left unset at session scope: the systemd user manager parents
+gnome-session, and re-homing it there has already cost a login keyring once.
+Repair existing state with: paths-doctor fix
+"""
+
+[[patterns]]
+id = "paths.agent_home_shadow"
+priority = 200
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(/home/[^/\s]+|\$HOME|~)/\.(codex|claude|gemini|copilot)($|[/\s"\x27:,;)\]}])' }
+message = """
+Each agent home is a surface, not a path. Read the variable:
+  CODEX_HOME   CLAUDE_CONFIG_DIR   GEMINI_CONFIG_DIR   COPILOT_HOME
+The profile frontdoor owns each home and rejects a competing owner by
+byte-for-byte string comparison, so writing ~/.codex or ~/.claude does not
+merely look untidy -- it makes that agent refuse to launch.
+Anchors are committed through envctl's agent-home-anchors cutover, the sole
+authoritative committer for those rows; never hand-edit the live table.
+"""
+
+[[patterns]]
+id = "paths.build_state_on_runtime_dir"
+priority = 200
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(CARGO_HOME|CARGO_TARGET_DIR|RUSTUP_HOME|GOCACHE|GOMODCACHE)\s*=\s*[^\s]*(/run/user/\d+|\$XDG_RUNTIME_DIR)' }
+message = """
+Build state must not resolve under $XDG_RUNTIME_DIR. That is a tmpfs whose
+budget is shared with the wayland socket, dconf, dbus and gnome-keyring, and it
+is cleared on logout -- a workspace build reached 30G there and drove it to 84%.
+The symptom is a binary that "does not exist" right after cargo reports success.
+Use the durable surface: $CARGO_HOME / $CARGO_TARGET_DIR are already exported.
+Never assume ./target either -- ask cargo where it actually put things:
+  cargo metadata --format-version 1 --no-deps | jq -r .target_directory
+$XDG_RUNTIME_DIR is correct for genuinely disposable caches, and only those.
+"""
+
+[[patterns]]
+id = "paths.yazelix_surface_hardcoded"
+priority = 160
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME)\s*=\s*[\x27"]?/' }
+message = """
+This assigns a surface an absolute literal. Surfaces are what make upstream
+work for any user on any box, so pinning one to a path is how a host stops
+being reproducible.
+
+Upstream's shape is a precedence chain, not an assignment:
+  YAZELIX_STATE_DIR -> $XDG_DATA_HOME/yazelix -> $HOME/.local/share/yazelix
+
+Approve only where a surface genuinely must be pinned -- the profile frontdoor
+and envctl's committers do exactly that, on purpose, and one of those literals
+must stay byte-identical to the frontdoor's own STATE_HOME because
+reject-competing-owner compares raw strings.
+
+Everywhere else, read the surface instead of setting it. Never hand-edit the
+live envctl table; route the change through its committer.
+"""
+
+[[patterns]]
+id = "paths.nix_store_hardcoded"
+priority = 150
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = '(^|["\x27=\s])/nix/store/[a-z0-9]{32}-' }
+message = """
+This names a /nix/store path by hash. Store paths change on every rebuild, so a
+pinned one is stale as soon as anything upstream of it moves.
+  in nix   -- reference the derivation, or builtins.storeDir
+  at run   -- $YAZELIX_NIX_STORE_ROOT, which upstream sets from builtins.storeDir
+  on PATH  -- the profile frontdoor, /home/<user>/.nix-profile/toolbin/<tool>
+Approve for one-off inspection of a specific store path.
+"""
+
+[[patterns]]
+id = "paths.rustup_not_used"
+priority = 150
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = 'RUSTUP_HOME|rustup\s+(install|default|toolchain|override)' }
+message = """
+This profile has no rustup. The Rust toolchain comes from FENIX
+(nix-community), composed in the yazelix flake:
+
+  flexnetosRustToolchain = fenixPkgs.combine [cargo rustc rustfmt clippy rust-analyzer]
+
+fenix REPLACES rustup -- the MSRV lane even wraps cargo with
+--unset RUSTUP_TOOLCHAIN. Setting RUSTUP_HOME or invoking rustup introduces a
+second toolchain owner. To change the toolchain, edit the flake input.
+"""
+
+[[patterns]]
+id = "paths.profile_package_for_build_input"
+priority = 150
+enabled = true
+decision = "ask"
+matcher = { type = "regex", pattern = 'nix\s+profile\s+(add|install).*(openssl|pkg-config|onnxruntime|zlib|sqlite)|PKG_CONFIG_PATH=' }
+message = """
+C build inputs come from a derivation's buildInputs -- never from the user
+profile, and never from PKG_CONFIG_PATH in a shell config. Adding one to the
+profile makes the build succeed for you and fail for everyone else. That is
+drift, not a fix.
+
+Working example -- packaging/icm_release.nix:
+  nativeBuildInputs = [ pkgs.pkg-config ];
+  buildInputs       = [ pkgs.openssl pkgs.onnxruntime ];
+  OPENSSL_NO_VENDOR = "1";
+
+If a raw `cargo build` fails on a -sys crate, build it through nix, or use the
+CI devshell that already carries pkg-config:
+  nix develop path:<yazelix>#ci
+"""

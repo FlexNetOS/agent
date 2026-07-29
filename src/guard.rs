@@ -17,7 +17,7 @@ use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 // ── Configuration ───────────────────────────────────────
@@ -272,11 +272,19 @@ impl GuardConfig {
         Self::load_from_file(path)
     }
 
-    /// Load config from user-level `~/.claude/agent-guard.toml`.
+    /// Load config from the user-level Claude home.
+    ///
+    /// `CLAUDE_CONFIG_DIR` wins when set: under the single-profile path law the
+    /// Claude home is `meta/var/lib/claude`, not `~/.claude`, and the frontdoor
+    /// exports that variable. Falling straight through to `~/.claude` made the
+    /// guard silently drop to its embedded defaults on exactly the hosts whose
+    /// policy it was meant to enforce.
     fn load_from_user() -> Option<Self> {
-        let home = dirs::home_dir()?;
-        let path = home.join(".claude/agent-guard.toml");
-        Self::load_from_file(&path)
+        let dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+            Some(v) if !v.is_empty() => PathBuf::from(v),
+            _ => dirs::home_dir()?.join(".claude"),
+        };
+        Self::load_from_file(&dir.join("agent-guard.toml"))
     }
 
     /// Load config from embedded default string.
