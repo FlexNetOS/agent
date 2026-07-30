@@ -429,14 +429,13 @@ enabled = true
 decision = "ask"
 matcher = { type = "regex", pattern = '(^|["\x27=\s])/tmp/[A-Za-z0-9._-]' }
 message = """
-This writes to /tmp directly. $TMPDIR is the surface, and this profile points it
-at the session-volatile root so scratch files are cleaned with the session
-instead of accumulating in a shared world-writable directory.
+This writes to /tmp directly. Use $TMPDIR for scratch files when the program
+supports that surface.
 
-Upstream's own last-resort state fallback is env::temp_dir()/yazelix, which
-honours $TMPDIR -- so even there /tmp is reached through the surface, never named.
+Upstream Yazelix state resolution has a distinct literal last-resort fallback:
+/tmp/yazelix. That fallback does not honour $TMPDIR; set YAZELIX_STATE_DIR or
+XDG_DATA_HOME when state must resolve elsewhere.
 
-Use $TMPDIR, or the session scratch directory when one is provided.
 Approve for genuinely throwaway inspection.
 """
 

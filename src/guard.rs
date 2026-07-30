@@ -2022,6 +2022,15 @@ message = "medium priority"
         assert!(evaluate_path_law("/home/bob/.gemini").is_some());
         assert!(evaluate_path_law("CARGO_TARGET_DIR=/run/user/4242/t").is_some());
     }
+    #[test]
+    fn tmpdir_prompt_distinguishes_the_literal_yazelix_fallback() {
+        let decision = evaluate_path_law("mkdir -p /tmp/yazelix")
+            .expect("a direct /tmp path must be reviewed");
+        assert_eq!(decision.decision, Decision::Ask);
+        assert!(decision.reason.contains("/tmp/yazelix"));
+        assert!(decision.reason.contains("does not honour $TMPDIR"));
+    }
+
 
     #[test]
     fn rtk_frontdoor_flags_every_segment_of_a_chain() {
