@@ -199,8 +199,8 @@ fn execute_validator(segment: &str, validator: &ValidatorConfig) -> bool {
 
 /// Check if all specified flags are present after a command.
 fn validate_flags_present(segment: &str, command: &str, required_flags: &[String]) -> bool {
-    let words: Vec<&str> = segment.split_whitespace().collect();
-    let cmd_pos = match words.iter().position(|w| *w == command) {
+    let words = shell_words(segment);
+    let cmd_pos = match words.iter().position(|word| word == command) {
         Some(pos) => pos,
         None => return false,
     };
@@ -221,8 +221,8 @@ fn validate_flags_present(segment: &str, command: &str, required_flags: &[String
 
 /// Check if any arguments after a command match values in a list.
 fn validate_args_match_any(segment: &str, command: &str, values: &[String]) -> bool {
-    let words: Vec<&str> = segment.split_whitespace().collect();
-    let cmd_pos = match words.iter().position(|w| *w == command) {
+    let words = shell_words(segment);
+    let cmd_pos = match words.iter().position(|word| word == command) {
         Some(pos) => pos,
         None => return false,
     };
@@ -233,7 +233,9 @@ fn validate_args_match_any(segment: &str, command: &str, values: &[String]) -> b
             continue; // Skip flags
         }
 
-        // Normalize path for comparison
+        // Quotes are shell syntax, not part of the target: Bash parses
+        // `./'.meta.yaml'` as `./.meta.yaml`. Match that same path rather than
+        // letting a quote inserted mid-word bypass a protected basename.
         let normalized = word.trim_end_matches('/');
         let normalized = if normalized.is_empty() {
             word // Keep original if it becomes empty (like "/")
@@ -244,9 +246,79 @@ fn validate_args_match_any(segment: &str, command: &str, values: &[String]) -> b
         if values.iter().any(|v| v == normalized || v == word) {
             return true;
         }
+
+        // A policy value beginning with '.' is a protected basename, not a
+        // host location. Comparing that component covers `./.meta.yaml` and
+        // absolute spellings while preserving the exact-match semantics for
+        // command arguments such as branch names.
+        let basename = normalized.rsplit('/').next().unwrap_or(normalized);
+        if values
+            .iter()
+            .any(|value| value.starts_with('.') && value == basename)
+        {
+            return true;
+        }
     }
 
     false
+}
+
+/// Split shell words while removing quote delimiters and joining adjacent
+/// quoted and unquoted fragments. This is deliberately small: validators only
+/// need to recognize command arguments, not execute shell expansions.
+fn shell_words(segment: &str) -> Vec<String> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in segment.chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+
+        match quote {
+            Some(Quote::Single) => {
+                if character == '\'' {
+                    quote = None;
+                } else {
+                    word.push(character);
+                }
+            }
+            Some(Quote::Double) => match character {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                _ => word.push(character),
+            },
+            None => match character {
+                '\'' => quote = Some(Quote::Single),
+                '"' => quote = Some(Quote::Double),
+                '\\' => escaped = true,
+                c if c.is_whitespace() => {
+                    if !word.is_empty() {
+                        words.push(std::mem::take(&mut word));
+                    }
+                }
+                _ => word.push(character),
+            },
+        }
+    }
+
+    if escaped {
+        word.push('\\');
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
 }
 
 impl GuardConfig {

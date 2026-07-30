@@ -231,6 +231,21 @@ LAW 1: never delete, always archive. Safer alternatives:
 decision source.)
 """
 
+# This deliberately uses only the validator schema shipped before the
+# quote-aware path matcher. A project policy can arrive before its rebuilt
+# guard binary; this matcher keeps protected Meta manifests denied during that
+# independent-repository rollout window.
+[[patterns]]
+id = "meta.rm.protected_manifest"
+priority = 101
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = 'rm(?:\s+[-\w=]+)*\s+(?:["\x27]?(?:(?:\./|\.\./)|(?:[^\s"\x27]+/))*["\x27]?)?\.meta(?:["\x27]?\.ya?ml)?["\x27]?(?:/)?(?:\s|$)' }
+message = """
+Deleting a protected Meta manifest is forbidden. Preserve control-plane
+metadata; use a reviewed migration or archive workflow instead.
+"""
+
 # ── path law ────────────────────────────────────────────────────────────────
 #
 # SOURCING LAW, and the reason this section exists at all:
