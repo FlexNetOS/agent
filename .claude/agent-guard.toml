@@ -551,11 +551,12 @@ id = "install.cargo_install"
 priority = 155
 enabled = true
 decision = "deny"
-matcher = { type = "regex", pattern = 'cargo\s+(\+\S+\s+)?install\b' }
+matcher = { type = "regex", pattern = 'cargo\s+(\+\S+\s+)?(install|binstall)\b' }
 message = """
 cargo install writes a binary into the cargo home's bin directory, which no
 rebuild reproduces and no closure records -- a second owner competing with the
-profile.
+profile. cargo binstall is the same outcome by a shorter route: it fetches a
+prebuilt binary into the same unowned location.
 
 To run a crate you are developing, do not install it:
   rtk cargo run --bin <name> -- <args>
@@ -570,10 +571,12 @@ id = "install.global_node_package"
 priority = 155
 enabled = true
 decision = "deny"
-matcher = { type = "regex", pattern = '(npm|pnpm|bun)\s+(i|in|install|add)\b[^\n]*\s(-g|--global)\b|yarn\s+global\s+add\b' }
+matcher = { type = "regex", pattern = '(npm|pnpm|bun)\s[^\n]*\b(install|add|in|i)\b[^\n]*(--global|-g)\b|(npm|pnpm|bun)\s[^\n]*(--global|-g)\b[^\n]*\b(install|add|in|i)\b|npm\s[^\n]*--location[= ]global|yarn\s+global\s+add\b' }
 message = """
 A global node install places a binary in a node prefix outside the profile --
-a second owner, and one that a rebuild silently reverts.
+a second owner, and one that a rebuild silently reverts. Flag order does not
+change that, so `-g` before the subcommand and `--location=global` are the same
+violation as `install -g`.
 
 Run it without installing (works for one-off tooling):
   rtk npx <tool> <args>
