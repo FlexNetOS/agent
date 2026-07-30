@@ -578,10 +578,15 @@ a second owner, and one that a rebuild silently reverts. Flag order does not
 change that, so `-g` before the subcommand and `--location=global` are the same
 violation as `install -g`.
 
-Run it without installing (works for one-off tooling):
-  rtk npx <tool> <args>
-  rtk pnpm dlx <tool>@latest <args>
-Project dependencies belong in the project: rtk npm install <pkg> (no -g).
+Use the profile-owned Bun lane, never Node/npm/npx or a user-bin shadow. The
+flake contract asserts npm, npx, pnpm, corepack and yarn are ABSENT from this
+profile, so any remedy naming them is broken before it is even run. Bun is
+pinned at 1.3.14 with bunx alongside it, and node comes from nodejs_24.
+
+  run a tool once      rtk bunx --bun <tool>@latest <args>
+  add a project dep    rtk bun add <pkg>
+  install project deps rtk bun install
+
 To make a tool permanent, declare it as a flake input and let the profile own it.
 """
 
