@@ -466,3 +466,40 @@ every rebuild -- a literal here points at the previous generation's file.
 Read the surface. Approve inside the nushell or nix layer that legitimately
 produces the value.
 """
+
+# ── RTK frontdoor ───────────────────────────────────────────────────────────
+#
+# RTK is the mandated frontdoor for shell work here, and the documented golden
+# rule is explicit that this holds INSIDE CHAINS TOO -- `rtk git add . && git
+# commit` is the canonical violation, because the first segment is disciplined
+# and every later one silently is not.
+#
+# Anchored on ^ alone, because evaluate_command() has ALREADY split the command
+# on && || ; and standalone pipes before a pattern is tested. Matching the
+# delimiters here as well would fire on a semicolon inside a quoted string.
+#
+# The set is the full documented RTK command list. Earlier drafts carved out
+# grep, ls, env, curl, diff and wget on the assumption that a prefix would break
+# them; every one of those assumptions was tested and FALSE:
+#
+#   printf ... | rtk grep -c foo   -> correct count from stdin
+#   rtk ls -la FILE                -> mode preserved (octal 664, not symbolic)
+#   rtk env -i HOME=x FOO=bar CMD  -> clean-env invocation works
+#   rtk diff -q A B                -> correct quiet compare
+#
+# The golden rule is literal: RTK uses a filter when it has one and passes the
+# command through unchanged when it does not, so it is always safe. Do not add
+# an exclusion here without a transcript showing the prefixed form failing.
+#
+# `test` is the one empirically-broken name and stays out: `rtk test` is the
+# generic TEST-RUNNER wrapper, so `rtk test -x FILE` prints runner help instead
+# of evaluating the file predicate. Shell builtins and keywords (cd, export,
+# read, for, if) cannot be prefixed at all, and the RTK-internal subcommand
+# names (log, json, deps, summary, err) are not standalone commands.
+
+# This rule is DENY-BY-DEFAULT and therefore lives in code, not here: it must
+# match a segment whose first token is NOT rtk, and the regex crate has no
+# lookahead. See evaluate_rtk_frontdoor() in src/guard.rs. An allowlist of
+# "tools that need the prefix" was the wrong shape -- it silently permits every
+# command nobody remembered to list, which is the same hole the rule exists to
+# close.

@@ -454,7 +454,95 @@ pub fn handle_guard() -> Result<()> {
         emit_denial(denial.reason, denial.decision)?;
     }
 
+    if let Some(denial) = evaluate_rtk_frontdoor(&command) {
+        emit_denial(denial.reason, denial.decision)?;
+    }
+
     Ok(())
+}
+
+/// Shell builtins and keywords that cannot carry an `rtk` prefix at all --
+/// prefixing them would either change the shell's parse or invoke a different
+/// program. `test` is here for the second reason: `rtk test` is RTK's generic
+/// test-RUNNER wrapper, so `rtk test -x FILE` prints runner help instead of
+/// evaluating the file predicate.
+const UNPREFIXABLE: &[&str] = &[
+    ".", ":", "[", "[[", "alias", "bg", "break", "case", "cd", "continue", "declare", "do", "done",
+    "elif", "else", "esac", "eval", "exec", "exit", "export", "fi", "for", "function", "getopts",
+    "hash", "if", "jobs", "let", "local", "printf", "pwd", "read", "readonly", "return", "select",
+    "set", "shift", "source", "test", "then", "time", "times", "trap", "type", "typeset", "ulimit",
+    "umask", "unalias", "unset", "until", "wait", "while",
+];
+
+/// Frontdoor commands that the owner's own instructions invoke bare. RTK.md
+/// shows `rtk ...`; CLAUDE.md's ICM section shows `icm recall` / `icm store`;
+/// meta-workspace-discipline.md requires `meta git ...` for cross-repo work.
+/// Every entry traces to a documented invocation, not to a judgement call.
+const FRONTDOOR_COMMANDS: &[&str] = &["rtk", "meta", "icm", "agent", "yzx"];
+
+/// Enforce the RTK frontdoor: every command segment runs through `rtk`.
+///
+/// Deliberately deny-by-default. The documented golden rule is "always prefix
+/// commands with rtk" -- RTK uses a dedicated filter when it has one and passes
+/// the command through unchanged when it does not, so the prefix is always
+/// safe. Verified against jq, readlink, stat, printf, nix, mkdir and sed, and
+/// against the forms people assume it breaks: `| rtk grep -c` reads stdin,
+/// `rtk ls -la` keeps the mode bits, `rtk env -i` runs a clean-env invocation,
+/// `rtk diff -q` compares quietly.
+///
+/// An allowlist of tools-that-need-prefixing was tried first and was the wrong
+/// shape: it permits everything absent from the list, so the rule silently
+/// stops covering whatever it did not anticipate.
+pub fn evaluate_rtk_frontdoor(command: &str) -> Option<DenyReason> {
+    for segment in split_compound_command(command) {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Leading VAR=value assignments belong to the command that follows.
+        let head = trimmed
+            .split_whitespace()
+            .find(|tok| !tok.contains('=') || tok.starts_with('-'))
+            .unwrap_or("");
+        if head.is_empty() {
+            continue;
+        }
+
+        // A subshell or redirection fragment has no command of its own here.
+        if head.starts_with(['(', '{', '<', '>', '&', '#']) {
+            continue;
+        }
+
+        let name = head.rsplit('/').next().unwrap_or(head);
+        if FRONTDOOR_COMMANDS.contains(&name) || UNPREFIXABLE.contains(&name) {
+            continue;
+        }
+
+        return Some(DenyReason {
+            reason: format!(
+                "Shell work enters through RTK, and `{name}` is not prefixed.\n\
+                 \n\
+                 \x20 wrong   rtk git add . && git commit -m \"msg\"\n\
+                 \x20 right   rtk git add . && rtk git commit -m \"msg\"\n\
+                 \n\
+                 The golden rule holds inside chains: EVERY segment after && || ; and\n\
+                 every stage of a pipe needs its own rtk. RTK is always safe -- it uses\n\
+                 a dedicated filter when it has one and passes the command through\n\
+                 unchanged when it does not. It also handles the forms people assume it\n\
+                 cannot: `| rtk grep -c` reads stdin, `rtk ls -la` keeps the mode bits,\n\
+                 `rtk env -i` runs a clean-env invocation, `rtk diff -q` compares quietly.\n\
+                 \n\
+                 Not flagged: rtk/meta/icm/agent/yzx, and shell builtins and keywords,\n\
+                 which cannot take a prefix. `test` is among them because `rtk test` is\n\
+                 the test-RUNNER wrapper and does not evaluate `test -x FILE`.\n\
+                 \n\
+                 Approve only with evidence that the prefixed form actually fails.\n"
+            ),
+            decision: Decision::Ask,
+        });
+    }
+    None
 }
 
 // ── Types ───────────────────────────────────────────────
@@ -1929,6 +2017,70 @@ message = "medium priority"
         assert!(evaluate_path_law("/home/alice/.local/share/rtk").is_some());
         assert!(evaluate_path_law("/home/bob/.gemini").is_some());
         assert!(evaluate_path_law("CARGO_TARGET_DIR=/run/user/4242/t").is_some());
+    }
+
+    #[test]
+    fn rtk_frontdoor_flags_every_segment_of_a_chain() {
+        // The canonical violation: the first segment is disciplined and every
+        // later one silently is not.
+        assert!(evaluate_rtk_frontdoor("git status").is_some());
+        assert!(evaluate_rtk_frontdoor("rtk git add . && git commit -m \"m\"").is_some());
+        assert!(evaluate_rtk_frontdoor("rtk cargo fmt; cargo clippy").is_some());
+        assert!(evaluate_rtk_frontdoor("rtk git status && git diff --stat").is_some());
+    }
+
+    #[test]
+    fn rtk_frontdoor_covers_every_pipe_stage() {
+        // Pipes are segments too -- a filter stage skipped the prefix just as
+        // easily as a && stage did.
+        assert!(evaluate_rtk_frontdoor("rtk ls /etc | grep -c conf").is_some());
+        assert!(evaluate_rtk_frontdoor("rtk ls /etc | rtk grep -c conf").is_none());
+    }
+
+    #[test]
+    fn rtk_frontdoor_is_deny_by_default_not_an_allowlist() {
+        // The point of the rewrite: a tool nobody thought to enumerate is still
+        // covered. An allowlist silently permitted all of these.
+        for cmd in [
+            "jq -nc '{a:1}'",
+            "readlink -f /home/someone/.nix-profile",
+            "stat -c '%a' /etc/passwd",
+            "nix build .#foundation",
+            "sed -n '1p' f.txt",
+            "curl https://example.com",
+        ] {
+            assert!(
+                evaluate_rtk_frontdoor(cmd).is_some(),
+                "frontdoor rule missed: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_frontdoor_accepts_prefixed_and_frontdoor_commands() {
+        assert!(evaluate_rtk_frontdoor("rtk git add . && rtk git commit -m \"m\"").is_none());
+        assert!(evaluate_rtk_frontdoor("rtk cargo build && rtk cargo test").is_none());
+        // Documented bare invocations: meta-workspace-discipline.md requires
+        // `meta git ...`; CLAUDE.md's ICM section shows `icm store ...`.
+        assert!(evaluate_rtk_frontdoor("meta git status").is_none());
+        assert!(evaluate_rtk_frontdoor("icm recall \"paths\"").is_none());
+        // An absolute path to the frontdoor is still the frontdoor.
+        assert!(
+            evaluate_rtk_frontdoor("/home/someone/.nix-profile/toolbin/rtk git status").is_none()
+        );
+    }
+
+    #[test]
+    fn rtk_frontdoor_skips_what_cannot_take_a_prefix() {
+        // Shell builtins and keywords, and `test` -- `rtk test` is the
+        // test-RUNNER wrapper, so `rtk test -x FILE` does not evaluate the
+        // predicate. Verified: it prints runner help.
+        assert!(evaluate_rtk_frontdoor("cd /tmp").is_none());
+        assert!(evaluate_rtk_frontdoor("export FOO=bar").is_none());
+        assert!(evaluate_rtk_frontdoor("test -x /usr/bin/env").is_none());
+        // A leading VAR=value assignment belongs to the command after it.
+        assert!(evaluate_rtk_frontdoor("RUST_LOG=debug rtk cargo test").is_none());
+        assert!(evaluate_rtk_frontdoor("RUST_LOG=debug cargo test").is_some());
     }
 
     #[test]
