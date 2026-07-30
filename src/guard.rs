@@ -510,8 +510,10 @@ pub fn handle_guard() -> Result<()> {
         return Ok(());
     }
 
-    // Only evaluate Bash tool for destructive command patterns
-    if !matches!(tool_name, "" | "Bash") {
+    // Only evaluate command-running tools for destructive patterns. Codex
+    // spells the same capability `exec_command` (and lowercase `bash`), so
+    // gating on "Bash" alone left every Codex exec unguarded.
+    if !matches!(tool_name, "" | "Bash" | "bash" | "exec_command") {
         return Ok(());
     }
 
@@ -521,9 +523,10 @@ pub fn handle_guard() -> Result<()> {
     };
 
     // A hook may emit exactly ONE decision object. The pattern rules run first
-    // because they carry the deny verdicts; the frontdoor rule only asks, so a
-    // real violation must not be masked by a missing rtk prefix on the same
-    // command. Whichever fires first returns.
+    // because they name the specific destructive act; the frontdoor is the
+    // generic fallback, so a real violation must not be masked by the more
+    // general "missing rtk prefix" message on the same command. Whichever
+    // fires first returns.
     if let Some(denial) = evaluate_command(&command) {
         emit_denial(denial.reason, denial.decision)?;
         return Ok(());
@@ -569,6 +572,11 @@ const FRONTDOOR_COMMANDS: &[&str] = &["rtk", "meta", "icm", "agent", "yzx"];
 /// An allowlist of tools-that-need-prefixing was tried first and was the wrong
 /// shape: it permits everything absent from the list, so the rule silently
 /// stops covering whatever it did not anticipate.
+///
+/// Returns `Deny`, not `Ask`. Under `permissions.defaultMode=dontAsk` an `Ask`
+/// is already a hard block, so it only produced a dead-end prompt. Denying
+/// states plainly that the repair is to re-send with the prefix, and
+/// `rtk proxy -- <cmd>` stays available for a genuinely unfilterable command.
 pub fn evaluate_rtk_frontdoor(command: &str) -> Option<DenyReason> {
     for segment in split_compound_command(command) {
         let trimmed = segment.trim();
@@ -613,9 +621,11 @@ pub fn evaluate_rtk_frontdoor(command: &str) -> Option<DenyReason> {
                  which cannot take a prefix. `test` is among them because `rtk test` is\n\
                  the test-RUNNER wrapper and does not evaluate `test -x FILE`.\n\
                  \n\
-                 Approve only with evidence that the prefixed form actually fails.\n"
+                 Re-send the command with the prefix; no approval is needed. If a\n\
+                 prefixed form genuinely cannot run, `rtk proxy -- <cmd>` runs it\n\
+                 unfiltered and is accepted here too.\n"
             ),
-            decision: Decision::Ask,
+            decision: Decision::Deny,
         });
     }
     None
@@ -632,6 +642,12 @@ struct HookInput {
 #[derive(Deserialize)]
 struct ToolInput {
     command: Option<String>,
+    /// Codex's `exec_command` carries the command here instead of in
+    /// `command`. Without this field the identical destructive command is
+    /// denied for Claude and silently allowed for Codex. RTK's own codex hook
+    /// adapter reads the same two keys, so this mirrors an existing contract
+    /// rather than inventing one.
+    cmd: Option<String>,
     file_path: Option<String>,
     notebook_path: Option<String>,
     /// Write payload; scanned by the path-law rules so a forbidden path cannot
@@ -814,6 +830,10 @@ fn normalize_path(path: &Path) -> std::path::PathBuf {
 // ── Input Parsing ───────────────────────────────────────
 
 /// Extract the command string from hook JSON input.
+///
+/// Accepts both harness shapes: Claude sends `tool_input.command`, Codex's
+/// `exec_command` sends `tool_input.cmd`. Reading only the first left every
+/// Codex exec unguarded.
 /// Returns None if input is empty, malformed, or missing the command field.
 fn parse_command(input: &str) -> Option<String> {
     let trimmed = input.trim();
@@ -821,7 +841,8 @@ fn parse_command(input: &str) -> Option<String> {
         return None;
     }
     let hook_input: HookInput = serde_json::from_str(trimmed).ok()?;
-    let command = hook_input.tool_input?.command?;
+    let tool_input = hook_input.tool_input?;
+    let command = tool_input.command.or(tool_input.cmd)?;
     if command.trim().is_empty() {
         return None;
     }
@@ -1754,6 +1775,48 @@ message = "Custom reset message"
     }
 
     #[test]
+    fn policy_remains_parseable_by_pre_quote_aware_validator_schema() {
+        // Independent peers can update the policy checkout before the guard
+        // binary. This models the validator schema shipped before shell-word
+        // normalization, so a new policy cannot make that agent discard the
+        // project config and fall back to its embedded defaults.
+        #[derive(Deserialize)]
+        struct LegacyPolicy {
+            patterns: Vec<LegacyPattern>,
+        }
+
+        #[derive(Deserialize)]
+        struct LegacyPattern {
+            #[serde(default)]
+            validator: Option<LegacyValidator>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum LegacyValidator {
+            #[serde(rename = "not_contains")]
+            NotContains { value: String },
+            #[serde(rename = "flags_present")]
+            FlagsPresent { command: String, flags: Vec<String> },
+            #[serde(rename = "args_match_any")]
+            ArgsMatchAny {
+                command: String,
+                values: Vec<String>,
+            },
+            #[serde(rename = "all_of")]
+            AllOf { validators: Vec<LegacyValidator> },
+            #[serde(rename = "any_of")]
+            AnyOf { validators: Vec<LegacyValidator> },
+            #[serde(rename = "not")]
+            Not { validator: Box<LegacyValidator> },
+        }
+
+        let policy: LegacyPolicy = toml::from_str(DEFAULT_CONFIG)
+            .expect("current policy must load on the preceding guard schema");
+        assert!(!policy.patterns.is_empty());
+    }
+
+    #[test]
     fn disabled_pattern_is_not_checked() {
         // Create a custom config with git_force_push disabled
         let toml = r#"
@@ -2087,15 +2150,11 @@ message = "medium priority"
     }
 
     #[test]
-    fn path_law_is_host_agnostic() {
-        // The rules key on shape, not on one machine's directories, so they hold
-        // for any user at any uid.
-        assert!(evaluate_path_law("/home/alice/.local/share/rtk").is_some());
-        assert!(evaluate_path_law("/home/bob/.gemini").is_some());
-        assert!(evaluate_path_law("CARGO_TARGET_DIR=/run/user/4242/t").is_some());
-    }
-    #[test]
     fn tmpdir_prompt_distinguishes_the_literal_yazelix_fallback() {
+        // Upstream (luccahuguet) runtime/yzx/paths.rs state_dir() ends in an
+        // infallible `/tmp/yazelix`. The FlexNetOS fork instead errors with
+        // "YAZELIX_STATE_DIR or XDG_RUNTIME_DIR is required" -- a local design
+        // choice that must NOT be written into policy as upstream law.
         let decision = evaluate_path_law("mkdir -p /tmp/yazelix")
             .expect("a direct /tmp path must be reviewed");
         assert_eq!(decision.decision, Decision::Ask);
@@ -2103,6 +2162,14 @@ message = "medium priority"
         assert!(decision.reason.contains("does not honour $TMPDIR"));
     }
 
+    #[test]
+    fn path_law_is_host_agnostic() {
+        // The rules key on shape, not on one machine's directories, so they hold
+        // for any user at any uid.
+        assert!(evaluate_path_law("/home/alice/.local/share/rtk").is_some());
+        assert!(evaluate_path_law("/home/bob/.gemini").is_some());
+        assert!(evaluate_path_law("CARGO_TARGET_DIR=/run/user/4242/t").is_some());
+    }
 
     #[test]
     fn rtk_frontdoor_flags_every_segment_of_a_chain() {
@@ -2112,6 +2179,88 @@ message = "medium priority"
         assert!(evaluate_rtk_frontdoor("rtk git add . && git commit -m \"m\"").is_some());
         assert!(evaluate_rtk_frontdoor("rtk cargo fmt; cargo clippy").is_some());
         assert!(evaluate_rtk_frontdoor("rtk git status && git diff --stat").is_some());
+    }
+
+    #[test]
+    fn rm_rule_covers_shell_quoted_spelling_of_each_protected_target() {
+        // One file, three spellings: exact-value matching guarded only the
+        // bare form, so `./.meta.yaml` and the absolute path walked straight
+        // through a rule the docs advertise as covering ".meta* paths".
+        let values = vec![".meta".to_string(), ".meta.yaml".to_string()];
+        for command in [
+            "rm -rf .meta.yaml",
+            "rm -rf ./.meta.yaml",
+            "rm -rf './.meta.yaml'",
+            "rm -rf ./'.meta.yaml'",
+            "rm -rf \"/any/where/.meta.yaml\"",
+            "rm -rf /any/where/.meta.yaml",
+            "rm -rf /a/b/.meta/",
+        ] {
+            assert!(
+                validate_args_match_any(command, "rm", &values),
+                "missed: {command}"
+            );
+        }
+        // Unrelated targets stay allowed -- this must not widen into a
+        // blanket rm ban.
+        assert!(!validate_args_match_any(
+            "rm -rf node_modules",
+            "rm",
+            &values
+        ));
+        assert!(!validate_args_match_any(
+            "rm -rf /tmp/meta.yaml",
+            "rm",
+            &values
+        ));
+    }
+
+    #[test]
+    fn legacy_compatible_manifest_pattern_covers_quoted_fragments() {
+        let patterns = GuardConfig::load_from_embedded().compile_patterns();
+        let compatibility_rule = patterns
+            .iter()
+            .find(|pattern| pattern.id == "meta.rm.protected_manifest")
+            .expect("the policy must retain a schema-free compatibility rule");
+        assert!(compatibility_rule.validator.is_none());
+
+        for command in [
+            "rtk rm -rf ./.meta.yaml",
+            "rtk rm -rf ./'.meta.yaml'",
+            "rtk rm -rf './.meta.yaml'",
+        ] {
+            assert!(
+                compatibility_rule.regex.is_match(command),
+                "missed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_harness_payload_shapes_yield_the_same_command() {
+        // The guard is wired into Claude and Codex alike, and the two spell the
+        // command differently. Reading only `command` meant an identical
+        // destructive call was denied for one agent and allowed for the other.
+        let claude = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+        let codex = r#"{"tool_name":"exec_command","tool_input":{"cmd":"git status"}}"#;
+        assert_eq!(parse_command(claude), Some("git status".to_string()));
+        assert_eq!(parse_command(codex), Some("git status".to_string()));
+    }
+
+    #[test]
+    fn rtk_frontdoor_denies_rather_than_asking() {
+        // Load-bearing, and previously flip-flopped: `deny` returns the reason
+        // to the model, which re-sends the prefixed form unattended. `ask`
+        // escalates to the operator and keeps prompting even with auto-accept
+        // on, so a missing prefix -- a style violation with a mechanical fix --
+        // costs a human approval on every pipe stage. Do not change this back
+        // to Ask without a hook contract that lets `ask` auto-resolve.
+        let decision = evaluate_rtk_frontdoor("rtk ls /etc | head -5")
+            .expect("the unprefixed pipe stage must be diagnosed");
+        assert_eq!(decision.decision, Decision::Deny);
+        // The escape hatch the message points at must itself be accepted, so
+        // the rule can never trap a caller with no legal form.
+        assert!(evaluate_rtk_frontdoor("rtk proxy -- bash -c 'head -5 f'").is_none());
     }
 
     #[test]
