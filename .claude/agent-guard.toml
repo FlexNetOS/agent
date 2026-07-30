@@ -2,24 +2,21 @@
 # Schema Version: 1.1 (adds per-pattern `decision = "deny" | "ask"`; default "deny")
 #
 # OWNERSHIP — one source owns each rule:
-#   CANONICAL: envctl repo, home/.claude/agent-guard.toml. envctl agent-env is the
-#     agent-config owner (fleet doctrine); it materializes this file into agent
-#     homes as ~/.claude/agent-guard.toml (user-level load path of the engine).
-#   MIRROR (traceable, byte-identical): meta `agent` repo, .claude/agent-guard.toml.
-#     Compiled into the `agent` binary as the embedded default fallback. It MUST
-#     stay byte-identical to the canonical copy; drift fails the mirror-parity
-#     clause of envctl scripts/tests/test-guard-policy-parity.sh.
-#   ADAPTER: envctl home/.claude/hooks/guard-bash.sh mirrors these decisions on the
-#     hook route and adds only refinements this schema cannot express:
-#       envctl.rm.archive_first              (rm of any non-scratch path -> deny;
-#                                             needs path resolution + scratch whitelist)
-#       envctl.claude.nested_session_precise (quote-stripping command-position parse)
-#     Decision parity is enforced by the corpus clause of the same test.
+#   CANONICAL: Meta's tracked .claude/agent-guard.toml. Meta is the workspace
+#     control plane and owns its tracked policy.
+#   MIRROR (traceable, byte-identical): the `agent` peer's
+#     .claude/agent-guard.toml, compiled into the `agent` binary as its embedded
+#     default fallback.
+#   ADAPTERS may refine parsing on their own hook routes, but may not become a
+#     policy source or override these decisions.
 #
 # Load hierarchy of the engine: ./.claude/agent-guard.toml (project) ->
-# ~/.claude/agent-guard.toml (user, envctl-materialized) -> embedded default.
-# All three levels must carry this same consolidated content; a project-level
-# fork is a policy fork and must be treated as an incident.
+# ~/.claude/agent-guard.toml (user) -> embedded default. All policy copies used
+# for this workspace must carry this consolidated content; a project-level fork
+# is a policy fork and must be treated as an incident.
+#
+# envctl has no authority over this policy. Do not infer authority from a local
+# projection, a generated file, or a tool being present on this host.
 #
 # NUSHELL-ONLY AGENT PLANE (YZXCONV-017): agents execute shell actions only
 # through the profile-owned Nushell; Bash/sh/zsh/fish/xonsh are owner-only, with
@@ -34,7 +31,7 @@
 schema_version = "1.1"
 
 [metadata]
-source = "envctl-agent-env"
+source = "flexnetos-meta"
 version = "0.2.0"
 description = "Consolidated agent guard policy (ARCHBP-031): single source, adapters consume"
 
@@ -230,8 +227,8 @@ LAW 1: never delete, always archive. Safer alternatives:
 - Remove specific scratch files instead of entire directories
 - meta --dry-run exec -- <cmd> to preview operations
 - meta git snapshot create <name> before destructive operations
-(guard-bash.sh additionally enforces envctl.rm.archive_first for any
-non-scratch path.)
+(Hook adapters may apply parser refinements, but this policy remains the
+decision source.)
 """
 
 # ── path law ────────────────────────────────────────────────────────────────
@@ -261,11 +258,11 @@ non-scratch path.)
 # them names a directory this profile chose. They hold for any user, at any
 # uid, on any box, which is the test for whether a rule belongs here.
 #
-# Upstream's resolver is the reference shape: a precedence chain over surfaces,
-# ending in a fallback (crates/yzx-open/src/main.rs, crates/yzx-config/src/paths.rs):
+# Upstream Yazelix's resolver is the reference shape: a precedence chain over
+# surfaces, ending in a fallback (runtime/yzx/paths.rs):
 #
 #   state   YAZELIX_STATE_DIR -> $XDG_DATA_HOME/yazelix
-#             -> $HOME/.local/share/yazelix -> env::temp_dir()/yazelix
+#             -> $HOME/.local/share/yazelix -> /tmp/yazelix
 #   config  YAZELIX_CONFIG_HOME -> $XDG_CONFIG_HOME/yazelix
 #             -> $HOME/.config/yazelix
 #
@@ -273,9 +270,8 @@ non-scratch path.)
 # Reaching one means no surface was set; the repair is to set the surface, never
 # to fight the path. Empty is unset -- upstream reads through nonempty_env.
 #
-# Division of labour: this policy is host-agnostic and denies the WRITE.
-# envctl's paths-doctor is host-specific and repairs the STATE. A fact about
-# this machine belongs there, never here.
+# This policy is host-agnostic and guards writes. Host repair authority must be
+# proven separately; it is never conferred by a local tool or projection.
 
 [[patterns]]
 id = "paths.dotlocal_tool_state"
@@ -292,10 +288,7 @@ Both are exported by the profile frontdoor, so the tool's own XDG resolution
 finds them with no path in your command at all.
 
 If a tool is landing under ~/.local anyway, its surface is unset in that
-process -- fix the surface, not the path. Note that XDG_CONFIG_HOME is
-deliberately left unset at session scope: the systemd user manager parents
-gnome-session, and re-homing it there has already cost a login keyring once.
-Repair existing state with: paths-doctor fix
+process -- repair the owning configuration, not the path in an agent command.
 """
 
 [[patterns]]
@@ -307,11 +300,10 @@ matcher = { type = "regex", pattern = '(/home/[^/\s]+|\$HOME|~)/\.(codex|claude|
 message = """
 Each agent home is a surface, not a path. Read the variable:
   CODEX_HOME   CLAUDE_CONFIG_DIR   GEMINI_CONFIG_DIR   COPILOT_HOME
-The profile frontdoor owns each home and rejects a competing owner by
-byte-for-byte string comparison, so writing ~/.codex or ~/.claude does not
-merely look untidy -- it makes that agent refuse to launch.
-Anchors are committed through envctl's agent-home-anchors cutover, the sole
-authoritative committer for those rows; never hand-edit the live table.
+The owning agent frontdoor may reject a competing home by byte-for-byte string
+comparison, so writing ~/.codex or ~/.claude does not merely look untidy -- it
+can make that agent refuse to launch. Change an agent home only through its
+proved owner.
 """
 
 [[patterns]]
@@ -342,16 +334,16 @@ This assigns a surface an absolute literal. Surfaces are what make upstream
 work for any user on any box, so pinning one to a path is how a host stops
 being reproducible.
 
-Upstream's shape is a precedence chain, not an assignment:
+Upstream Yazelix's shape is a precedence chain, not an assignment:
   YAZELIX_STATE_DIR -> $XDG_DATA_HOME/yazelix -> $HOME/.local/share/yazelix
 
-Approve only where a surface genuinely must be pinned -- the profile frontdoor
-and envctl's committers do exactly that, on purpose, and one of those literals
-must stay byte-identical to the frontdoor's own STATE_HOME because
-reject-competing-owner compares raw strings.
+Approve only where a surface genuinely must be pinned by its proved owner --
+for example, Yazelix's profile frontdoor. A pinned value can require
+byte-for-byte identity with the frontdoor's own value when the owner compares
+raw strings.
 
 Everywhere else, read the surface instead of setting it. Never hand-edit the
-live envctl table; route the change through its committer.
+owner's live configuration table; use that owner's documented committer.
 """
 
 [[patterns]]
@@ -453,18 +445,19 @@ id = "paths.config_surface_hardcoded"
 priority = 160
 enabled = true
 decision = "ask"
-matcher = { type = "regex", pattern = '(YAZELIX_HELIX_MANAGED_CONFIG_PATH|YAZELIX_HELIX_BRIDGE|YAZELIX_NIX_STORE_ROOT|HELIX_STEEL_CONFIG|LG_CONFIG_FILE)\s*=\s*["\x27]?/' }
+matcher = { type = "regex", pattern = '(YAZELIX_HELIX_MANAGED_CONFIG_PATH|YAZELIX_HELIX_BRIDGE|YAZELIX_NIX_STORE_ROOT|YAZELIX_STATUS_BAR_CACHE_PATH|YAZELIX_CURSOR_CONFIG|YZX_YAZI_STARSHIP_CONFIG|HELIX_STEEL_CONFIG|LG_CONFIG_FILE)\s*=\s*["\x27]?/' }
 message = """
-This pins a CONFIG surface to a path. The nushell layer sets these from the
-packaged runtime, and the managed-config surfaces in particular are rewritten on
-every rebuild -- a literal here points at the previous generation's file.
+This pins a Yazelix-owned config or runtime-path surface. Yazelix defines these
+surfaces; their values must travel with the runtime or resolver that owns them,
+not with an arbitrary shell command.
 
   YAZELIX_HELIX_MANAGED_CONFIG_PATH   YAZELIX_HELIX_BRIDGE
-  YAZELIX_HOST_POLICY_ROOT            YAZELIX_HOST_POLICY_TARGET_ROOT
-  HELIX_STEEL_CONFIG                  LG_CONFIG_FILE
+  YAZELIX_STATUS_BAR_CACHE_PATH       YAZELIX_CURSOR_CONFIG
+  YZX_YAZI_STARSHIP_CONFIG            HELIX_STEEL_CONFIG
+  LG_CONFIG_FILE
 
-Read the surface. Approve inside the nushell or nix layer that legitimately
-produces the value.
+Read the surface. Approve inside the Yazelix source or runtime layer that
+legitimately produces the value.
 """
 
 # ── RTK frontdoor ───────────────────────────────────────────────────────────

@@ -274,11 +274,9 @@ impl GuardConfig {
 
     /// Load config from the user-level Claude home.
     ///
-    /// `CLAUDE_CONFIG_DIR` wins when set: under the single-profile path law the
-    /// Claude home is `meta/var/lib/claude`, not `~/.claude`, and the frontdoor
-    /// exports that variable. Falling straight through to `~/.claude` made the
-    /// guard silently drop to its embedded defaults on exactly the hosts whose
-    /// policy it was meant to enforce.
+    /// `CLAUDE_CONFIG_DIR` wins when set because it is Claude's documented
+    /// configuration-home surface. When it is unset, Claude's supported
+    /// `~/.claude` fallback remains available.
     fn load_from_user() -> Option<Self> {
         let dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
             Some(v) if !v.is_empty() => PathBuf::from(v),
@@ -2131,6 +2129,9 @@ message = "medium priority"
             "export SHELL=/bin/bash",
             "export YAZELIX_HELIX_MANAGED_CONFIG_PATH=/some/config.toml",
             "export YAZELIX_NIX_STORE_ROOT=/some/store",
+            "export YAZELIX_STATUS_BAR_CACHE_PATH=/some/status-cache",
+            "export YAZELIX_CURSOR_CONFIG=/some/cursors.toml",
+            "export YZX_YAZI_STARSHIP_CONFIG=/some/yazi-starship.toml",
             "export LG_CONFIG_FILE=/some/lg.yml",
             "export YAZELIX_STATE_DIR=/some/state",
             "export XDG_CONFIG_HOME=/some/config",
@@ -2154,8 +2155,8 @@ message = "medium priority"
         // the local nushell config layer — a file with no upstream counterpart —
         // so the guard had started enforcing the drift it exists to prevent.
         //
-        // Where a cache lives is configuration. It belongs to paths-doctor,
-        // which repairs state on one host, not to a policy that ships everywhere.
+        // Where a cache lives is configuration. It belongs to its proved owner,
+        // not to a policy that ships everywhere.
         for local_policy in [
             "export HF_HOME=/run/user/1001/hf",
             "export TORCH_HOME=$XDG_RUNTIME_DIR/torch",
