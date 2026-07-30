@@ -450,12 +450,18 @@ pub fn handle_guard() -> Result<()> {
         None => return Ok(()), // No command to evaluate — allow
     };
 
+    // A hook may emit exactly ONE decision object. The pattern rules run first
+    // because they carry the deny verdicts; the frontdoor rule only asks, so a
+    // real violation must not be masked by a missing rtk prefix on the same
+    // command. Whichever fires first returns.
     if let Some(denial) = evaluate_command(&command) {
         emit_denial(denial.reason, denial.decision)?;
+        return Ok(());
     }
 
     if let Some(denial) = evaluate_rtk_frontdoor(&command) {
         emit_denial(denial.reason, denial.decision)?;
+        return Ok(());
     }
 
     Ok(())

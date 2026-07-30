@@ -34,19 +34,19 @@ setup() {
 # ============ Allow (safe commands) ============
 
 @test "guard allows git status" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"git status"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk git status"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
 
 @test "guard allows cargo build" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"cargo build"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk cargo build"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
 
 @test "guard allows normal git push" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"git push origin main"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk git push origin main"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
@@ -77,7 +77,7 @@ setup() {
 }
 
 @test "guard allows claude --version" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"claude --version"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk claude --version"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
@@ -89,25 +89,25 @@ setup() {
 }
 
 @test "guard allows git reset --soft" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"git reset --soft HEAD~1"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk git reset --soft HEAD~1"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
 
 @test "guard allows rm -rf on specific directory" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"rm -rf node_modules"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk rm -rf node_modules"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
 
 @test "guard allows git checkout branch" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"git checkout main"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk git checkout main"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
 
 @test "guard allows safe compound command" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"git add . && git commit -m msg && git push"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk git add . && rtk git commit -m msg && rtk git push"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
@@ -264,7 +264,7 @@ assert len(hso['permissionDecisionReason']) > 0
 }
 
 @test "guard allows git clean -f only (no -d)" {
-    run bash -c 'echo '"'"'{"tool_input":{"command":"git clean -f"}}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"tool_input":{"command":"rtk git clean -f"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
@@ -286,7 +286,7 @@ assert len(hso['permissionDecisionReason']) > 0
 # ============ Full hook input format ============
 
 @test "guard handles full hook input with extra fields" {
-    run bash -c 'echo '"'"'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status","description":"check status"},"session_id":"abc123","cwd":"/tmp"}'"'"' | '"$AGENT_BIN"' guard'
+    run bash -c 'echo '"'"'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rtk git status","description":"check status"},"session_id":"abc123","cwd":"/tmp"}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
