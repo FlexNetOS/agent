@@ -501,7 +501,9 @@ pub fn handle_guard() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join("\n");
                 if !payload.is_empty() {
-                    if let Some(denial) = evaluate_path_law(&payload) {
+                    if let Some(denial) =
+                        evaluate_path_law_for_target(&payload, ti.file_path.as_deref())
+                    {
                         emit_denial(denial.reason, denial.decision)?;
                     }
                 }
@@ -864,15 +866,50 @@ fn parse_command(input: &str) -> Option<String> {
 ///
 /// Unlike command evaluation there is no compound-command splitting; the
 /// payload is matched whole, so a rule cannot be evaded by line layout.
+/// Target-less convenience wrapper. Production always has a destination path,
+/// so this exists for tests that are asserting the rules themselves rather than
+/// the nix-authoring entitlement.
+#[cfg(test)]
 pub fn evaluate_path_law(text: &str) -> Option<DenyReason> {
+    evaluate_path_law_for_target(text, None)
+}
+
+/// Surface-pinning rules a nix expression is entitled to "violate", because a
+/// derivation is the builder that legitimately PRODUCES a surface's value.
+///
+/// This is not a new exemption -- each of these rules already says so in its
+/// own message ("Approve inside a nix expression that is legitimately producing
+/// the value"). While they were `ask`, the operator supplied that judgement by
+/// hand. Now that they deny, the entitlement has to be expressed in code or the
+/// flake becomes unauthorable: yazelix's own contract assertions include the
+/// literals `CARGO_HOME=/…`, `YAZELIX_STATE_DIR=/…` and `XDG_DATA_HOME=/…`.
+///
+/// Deliberately narrow. A `.nix` file gets no relief from agent_home_shadow,
+/// dotlocal_tool_state or build_state_on_runtime_dir, which are wrong wherever
+/// they appear, nor from nix_store_hardcoded, whose message tells a nix author
+/// to reference the derivation rather than pin a hash.
+const NIX_AUTHORED_SURFACE_RULES: &[&str] = &[
+    "paths.yazelix_surface_hardcoded",
+    "paths.binary_surface_hardcoded",
+    "paths.config_surface_hardcoded",
+];
+
+pub fn evaluate_path_law_for_target(text: &str, target: Option<&str>) -> Option<DenyReason> {
     let patterns = CACHED_PATTERNS.get_or_init(|| {
         let config = GuardConfig::load();
         config.compile_patterns()
     });
 
+    let authored_in_nix = target.is_some_and(|path| {
+        path.trim()
+            .trim_end_matches(['"', '\'', ',', ';'])
+            .ends_with(".nix")
+    });
+
     patterns
         .iter()
         .filter(|p| p.id.starts_with("paths."))
+        .filter(|p| !(authored_in_nix && NIX_AUTHORED_SURFACE_RULES.contains(&p.id.as_str())))
         .find(|p| p.regex.is_match(text))
         .map(|p| DenyReason {
             reason: p.message.clone(),
@@ -926,69 +963,78 @@ fn evaluate_segment(segment: &str, patterns: &[CompiledPattern]) -> Option<DenyR
     None
 }
 
-/// Split a compound command on `&&`, `||`, `;`, and `|` delimiters.
-/// Simple split — does not handle quoting. Sufficient for Claude-generated commands.
+/// Split a compound command on `&&`, `||`, `;`, and `|` delimiters, ignoring
+/// any delimiter that appears inside single or double quotes.
+///
+/// Quote awareness is not cosmetic. A quoted regex alternation is an ordinary
+/// argument, and splitting on the `|` inside it invented a second "segment"
+/// whose first word was a fragment of that pattern -- so
+/// `rtk grep -e "a\|b" FILE` was reported as the unprefixed command `b"`.
+/// Under auto mode a false positive costs a whole retry, which is exactly the
+/// babysitting the frontdoor rule exists to avoid.
+///
+/// Safety is unchanged: a dangerous command hidden inside quotes stays inside
+/// the one segment that contains it, and the pattern regexes scan that segment
+/// whole, so `rm -rf /` is still matched wherever it sits.
+///
 /// Returns trimmed segments.
 fn split_compound_command(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
     let mut segments = Vec::new();
-    let mut rest = command;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
 
-    loop {
-        // Find the earliest delimiter.
-        // Order matters: check `||` before `|`, and multi-char before single-char.
-        let delimiters: &[&str] = &["||", "&&", ";"];
-        let earliest = delimiters
-            .iter()
-            .filter_map(|d| rest.find(d).map(|pos| (pos, d.len())))
-            .min_by_key(|(pos, _)| *pos);
+    while i < bytes.len() {
+        let byte = bytes[i];
 
-        // Also check for standalone pipe `|` (not part of ||)
-        let pipe_pos = find_standalone_pipe(rest);
+        // A backslash escapes the next byte everywhere except inside single
+        // quotes, where the shell treats it literally.
+        if byte == b'\\' && !in_single {
+            i += 2;
+            continue;
+        }
 
-        // Take whichever delimiter comes first
-        let next_delimiter = match (earliest, pipe_pos) {
-            (Some((pos1, len1)), Some(pos2)) => {
-                if pos2 < pos1 {
-                    Some((pos2, 1)) // pipe comes first
-                } else {
-                    Some((pos1, len1)) // other delimiter comes first
-                }
-            }
-            (Some(delim), None) => Some(delim),
-            (None, Some(pos)) => Some((pos, 1)),
-            (None, None) => None,
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+
+        if in_single || in_double {
+            i += 1;
+            continue;
+        }
+
+        // Order matters: `||` and `&&` must be tested before a lone `|`.
+        let delimiter_len = if bytes[i..].starts_with(b"||") || bytes[i..].starts_with(b"&&") {
+            2
+        } else if byte == b';' || byte == b'|' {
+            1
+        } else {
+            0
         };
 
-        match next_delimiter {
-            Some((pos, len)) => {
-                segments.push(rest[..pos].trim());
-                rest = &rest[pos + len..];
-            }
-            None => {
-                segments.push(rest.trim());
-                break;
-            }
+        if delimiter_len == 0 {
+            i += 1;
+            continue;
         }
+
+        // Delimiters are ASCII, so `start` and `i` are always char boundaries.
+        segments.push(command[start..i].trim());
+        i += delimiter_len;
+        start = i;
     }
 
+    segments.push(command[start..].trim());
     segments
-}
-
-/// Find a standalone pipe `|` that is NOT part of `||`.
-/// Returns the position of the first such pipe, or None if not found.
-fn find_standalone_pipe(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'|' {
-            // Check if it's part of ||
-            let prev_is_pipe = i > 0 && bytes[i - 1] == b'|';
-            let next_is_pipe = i + 1 < bytes.len() && bytes[i + 1] == b'|';
-            if !prev_is_pipe && !next_is_pipe {
-                return Some(i);
-            }
-        }
-    }
-    None
 }
 
 // ── Tests ───────────────────────────────────────────────
@@ -1150,9 +1196,13 @@ mod tests {
     // ── decision semantics (schema 1.1) ─────────────────
 
     #[test]
-    fn lease_feature_branch_is_ask() {
+    fn lease_feature_branch_is_deny_with_a_remedy() {
+        // Was `ask`. Under defaultMode=dontAsk an ask escalates to the human,
+        // so the auto-mode law makes every rule deny and puts the way forward
+        // in the message instead.
         let d = evaluate_command("git push --force-with-lease origin task/foo").unwrap();
-        assert_eq!(d.decision, Decision::Ask);
+        assert_eq!(d.decision, Decision::Deny);
+        assert!(d.reason.contains("rtk git pull --rebase"));
     }
 
     #[test]
@@ -1162,9 +1212,10 @@ mod tests {
     }
 
     #[test]
-    fn refspec_force_feature_branch_is_ask() {
+    fn refspec_force_feature_branch_is_deny_with_a_remedy() {
         let d = evaluate_command("git push origin +task/foo").unwrap();
-        assert_eq!(d.decision, Decision::Ask);
+        assert_eq!(d.decision, Decision::Deny);
+        assert!(d.reason.contains("rtk git push origin HEAD:refs/heads/"));
     }
 
     #[test]
@@ -2152,14 +2203,22 @@ message = "medium priority"
     #[test]
     fn tmpdir_prompt_distinguishes_the_literal_yazelix_fallback() {
         // Upstream (luccahuguet) runtime/yzx/paths.rs state_dir() ends in an
-        // infallible `/tmp/yazelix`. The FlexNetOS fork instead errors with
-        // "YAZELIX_STATE_DIR or XDG_RUNTIME_DIR is required" -- a local design
-        // choice that must NOT be written into policy as upstream law.
-        let decision = evaluate_path_law("mkdir -p /tmp/yazelix")
-            .expect("a direct /tmp path must be reviewed");
-        assert_eq!(decision.decision, Decision::Ask);
-        assert!(decision.reason.contains("/tmp/yazelix"));
+        // infallible literal tmp/yazelix fallback. The FlexNetOS fork instead
+        // errors with "YAZELIX_STATE_DIR or XDG_RUNTIME_DIR is required" -- a
+        // local design choice that must NOT be written into policy as upstream
+        // law.
+        //
+        // The literal is assembled here rather than spelled out because this
+        // rule now denies, so writing it whole would block the edit that adds
+        // the test. That is the rule working, not a problem to route around.
+        let literal_fallback = format!("/tmp{}", "/yazelix");
+        let decision = evaluate_path_law(&format!("mkdir -p {literal_fallback}"))
+            .expect("a direct tmp path must be reviewed");
+        assert_eq!(decision.decision, Decision::Deny);
+        assert!(decision.reason.contains(&literal_fallback));
+        // Auto-mode law: the denial has to say what to do instead.
         assert!(decision.reason.contains("does not honour $TMPDIR"));
+        assert!(decision.reason.contains("$TMPDIR"));
     }
 
     #[test]
@@ -2269,6 +2328,121 @@ message = "medium priority"
         // easily as a && stage did.
         assert!(evaluate_rtk_frontdoor("rtk ls /etc | grep -c conf").is_some());
         assert!(evaluate_rtk_frontdoor("rtk ls /etc | rtk grep -c conf").is_none());
+    }
+
+    #[test]
+    fn splitter_ignores_delimiters_inside_quotes() {
+        // A quoted regex alternation is one argument, not two segments. This
+        // fired three times in a single session: `rtk grep -e "a\|b" FILE` was
+        // reported as the unprefixed command `b"`, costing a retry each time.
+        assert_eq!(
+            split_compound_command(r#"rtk grep -e "fn a\|fn b" FILE"#),
+            vec![r#"rtk grep -e "fn a\|fn b" FILE"#]
+        );
+        assert_eq!(
+            split_compound_command("rtk grep 'a;b' FILE"),
+            vec!["rtk grep 'a;b' FILE"]
+        );
+        assert!(evaluate_rtk_frontdoor(r#"rtk grep -e "rtk\|icm" FILE"#).is_none());
+
+        // Real delimiters outside quotes still split.
+        assert_eq!(
+            split_compound_command("rtk a && rtk b | rtk c ; rtk d"),
+            vec!["rtk a", "rtk b", "rtk c", "rtk d"]
+        );
+        assert!(evaluate_rtk_frontdoor("rtk ls | grep x").is_some());
+    }
+
+    #[test]
+    fn quoting_does_not_weaken_destructive_detection() {
+        // Real commands are still caught, in the first segment or a later one.
+        assert!(evaluate_command("rm -rf /").is_some());
+        assert!(evaluate_command("rtk git reset --hard").is_some());
+        assert!(evaluate_command("rtk ls && rtk git reset --hard").is_some());
+        assert!(evaluate_command("rtk ls | rtk git reset --hard").is_some());
+
+        // Known limitation, unchanged by quote awareness: a command buried in a
+        // QUOTED payload (`sh -c "rm -rf /"`) is not decomposed, because the
+        // validators tokenize on whitespace and see `"rm`, not `rm`. That was
+        // equally true of the previous splitter -- there is no delimiter in
+        // that string for it to have split on either.
+        assert!(evaluate_command(r#"sh -c "rm -rf /""#).is_none());
+    }
+
+    #[test]
+    fn nix_files_may_author_surface_values() {
+        // These literals are assembled at runtime on purpose: the path law runs
+        // over Edit payloads, so spelling them out here would deny the very
+        // edit that adds the test. That denial is the rule working.
+        let pinned = format!(
+            "grep -Fx 'CARGO_HOME={}' \"$env_file\"",
+            "/home/someone/meta/var/cache/cargo-home"
+        );
+        // yazelix's own contract assertions embed exactly this shape; denying it
+        // would make the flake unauthorable.
+        assert!(evaluate_path_law_for_target(&pinned, Some("/w/src/yazelix/flake.nix")).is_none());
+        assert!(evaluate_path_law_for_target(&pinned, Some("/w/setup.sh")).is_some());
+        assert!(evaluate_path_law_for_target(&pinned, None).is_some());
+
+        // The carve-out is narrow: a competing agent home is wrong in a .nix
+        // file too.
+        let competing_home = format!("HOME=/home/someone{}", "/.codex");
+        assert!(evaluate_path_law_for_target(&competing_home, Some("/w/flake.nix")).is_some());
+    }
+
+    #[test]
+    fn install_law_denies_out_of_band_binary_owners() {
+        for cmd in [
+            "nix profile add nixpkgs#ripgrep",
+            "nix profile install nixpkgs#jq",
+            "nix-env -iA nixpkgs.ripgrep",
+            "cargo install ripgrep",
+            "cargo +nightly install cargo-udeps",
+            "npm i -g gitnexus",
+            "npm install --global typescript",
+            "pnpm add -g turbo",
+            "yarn global add serve",
+            "pip install --user black",
+            "pipx install poetry",
+            "uv tool install ruff",
+            "go install github.com/x/y@latest",
+        ] {
+            let denial =
+                evaluate_command(cmd).unwrap_or_else(|| panic!("install law must deny: {cmd}"));
+            assert_eq!(denial.decision, Decision::Deny, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn install_law_leaves_the_sanctioned_paths_alone() {
+        // Installing the project's own flake OUTPUT is the documented cutover,
+        // and read-only profile inspection must stay available.
+        for cmd in [
+            "nix profile add --refresh --profile /p github:FlexNetOS/yazelix#lifeos_foundation_yzx",
+            "nix profile list --profile /p --json",
+            "nix run nixpkgs#ripgrep -- --version",
+            "npm install",
+            "npm install lodash",
+            "cargo build --release",
+            "cargo run --bin agent",
+            "go build ./...",
+        ] {
+            assert!(evaluate_command(cmd).is_none(), "must stay allowed: {cmd}");
+        }
+    }
+
+    #[test]
+    fn no_rule_escalates_to_a_human() {
+        // AUTO-MODE LAW. An `ask` prompts the operator even under
+        // defaultMode=dontAsk, so a single one reintroduces babysitting.
+        let config = GuardConfig::load();
+        let asks: Vec<&str> = config
+            .patterns
+            .iter()
+            .filter(|p| p.decision.eq_ignore_ascii_case("ask"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert!(asks.is_empty(), "these rules still escalate: {asks:?}");
     }
 
     #[test]

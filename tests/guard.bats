@@ -58,10 +58,14 @@ setup() {
     [[ "$output" == *"deny"* ]]
 }
 
-@test "guard asks on git push --force-with-lease to feature branch" {
+@test "guard denies --force-with-lease to a feature branch and names the remedy" {
+    # AUTO-MODE LAW: this was "ask". Under defaultMode=dontAsk an ask escalates
+    # to the human, so every rule denies and the message carries the way
+    # forward, letting the model self-correct unattended.
     run bash -c 'echo '"'"'{"tool_input":{"command":"git push --force-with-lease origin task/foo"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
-    [[ "$output" == *'"permissionDecision":"ask"'* ]]
+    [[ "$output" == *'"permissionDecision":"deny"'* ]]
+    [[ "$output" == *"rtk git pull --rebase"* ]]
 }
 
 @test "guard denies --dangerously-skip-permissions" {

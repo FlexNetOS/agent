@@ -24,9 +24,28 @@
 # This policy file adds no alternate-shell permission; launcher/hook enforcement
 # of the shell boundary is YZXCONV-017 scope and must not be weakened here.
 #
-# Decision semantics: "deny" blocks the tool call; "ask" escalates to the
-# operator (PreToolUse permissionDecision "ask"). Unknown values fail closed to
-# "deny". First match wins, highest priority first.
+# Decision semantics: "deny" blocks the tool call AND returns the reason to the
+# model; "ask" escalates to the operator. Unknown values fail closed to "deny".
+# First match wins, highest priority first.
+#
+# AUTO-MODE LAW: every rule here is "deny", and none may be "ask".
+#
+# The session runs at permissions.defaultMode = "dontAsk". An "ask" does not
+# become a silent allow there -- it escalates to the human and keeps prompting,
+# so every "ask" rule is a babysitting event by construction. Worse, an "ask"
+# message that ends "Approve for one-off inspection" promises a remedy that no
+# unattended session can reach, leaving the agent with nowhere to go.
+#
+# A "deny" is what makes unattended operation possible: the hook contract
+# returns the reason to the MODEL, which reads it and re-sends a compliant
+# command with no human in the loop. So the deny message is the whole
+# mechanism, and it carries one obligation:
+#
+#   EVERY MESSAGE MUST NAME THE EXACT COMMAND THAT IS ALLOWED.
+#
+# A denial that only says "no" strands the agent and costs a human round trip;
+# a denial that says "use this instead" is self-correcting. When adding a rule,
+# write the remedy first and the prohibition second.
 
 schema_version = "1.1"
 
@@ -93,22 +112,28 @@ multiple repos. Safer alternatives:
 id = "meta.git.push_refspec_force"
 priority = 95
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = 'git\s+push.*\s\+\S+' }
 message = """
-'+refspec' push force-updates the remote ref. Approve only for a private
-feature branch you know is disposable.
+'+refspec' push force-updates the remote ref and can discard commits that are
+already published. Reconcile instead of overwriting:
+  rtk git pull --rebase origin <branch> && rtk git push origin <branch>
+To publish a diverged local line without touching the shared one:
+  rtk git push origin HEAD:refs/heads/<new-branch>
 """
 
 [[patterns]]
 id = "meta.git.force_push_lease"
 priority = 90
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = 'git\s+push.*--force-with-lease' }
 message = """
---force-with-lease rewrites remote history (with an upstream check). Approve
-only for a private feature branch.
+--force-with-lease still rewrites remote history; the lease only checks that
+nobody pushed since your last fetch. Reconcile instead of rewriting:
+  rtk git pull --rebase origin <branch> && rtk git push origin <branch>
+To publish a diverged local line without touching the shared one:
+  rtk git push origin HEAD:refs/heads/<new-branch>
 """
 
 [[patterns]]
@@ -342,7 +367,7 @@ $XDG_RUNTIME_DIR is correct for genuinely disposable caches, and only those.
 id = "paths.yazelix_surface_hardcoded"
 priority = 160
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = '(YAZELIX_STATE_DIR|YAZELIX_CONFIG_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_CACHE_HOME|XDG_RUNTIME_DIR|CODEX_HOME|CLAUDE_CONFIG_DIR|GEMINI_CONFIG_DIR|COPILOT_HOME|CARGO_HOME|CARGO_TARGET_DIR|TMPDIR)\s*=\s*[\x27"]?/' }
 message = """
 This assigns a surface an absolute literal. Surfaces are what make upstream
@@ -352,20 +377,23 @@ being reproducible.
 Upstream Yazelix's shape is a precedence chain, not an assignment:
   YAZELIX_STATE_DIR -> $XDG_DATA_HOME/yazelix -> $HOME/.local/share/yazelix
 
-Approve only where a surface genuinely must be pinned by its proved owner --
-for example, Yazelix's profile frontdoor. A pinned value can require
-byte-for-byte identity with the frontdoor's own value when the owner compares
-raw strings.
+A surface may be pinned only by its proved owner -- Yazelix's profile
+frontdoor -- and that entitlement is automatic when you are editing a .nix
+file, because a derivation is the builder that produces the value. A pinned
+value can require byte-for-byte identity with the frontdoor's own value when
+the owner compares raw strings.
 
-Everywhere else, read the surface instead of setting it. Never hand-edit the
-owner's live configuration table; use that owner's documented committer.
+Everywhere else, read the surface instead of setting it:
+  nu   -> $env.XDG_DATA_HOME          sh -> "$XDG_DATA_HOME"
+Never hand-edit the owner's live configuration table; use that owner's
+documented committer.
 """
 
 [[patterns]]
 id = "paths.nix_store_hardcoded"
 priority = 150
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = '(^|["\x27=\s])/nix/store/[a-z0-9]{32}-' }
 message = """
 This names a /nix/store path by hash. Store paths change on every rebuild, so a
@@ -373,14 +401,15 @@ pinned one is stale as soon as anything upstream of it moves.
   in nix   -- reference the derivation, or builtins.storeDir
   at run   -- $YAZELIX_NIX_STORE_ROOT, which upstream sets from builtins.storeDir
   on PATH  -- the profile frontdoor, /home/<user>/.nix-profile/toolbin/<tool>
-Approve for one-off inspection of a specific store path.
+To inspect what the profile actually resolves to, derive it instead of pinning:
+  rtk nix profile list --profile <profile> --json | rtk jq -r '..|.storePaths?|arrays|.[]'
 """
 
 [[patterns]]
 id = "paths.rustup_not_used"
 priority = 150
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = 'RUSTUP_HOME|rustup\s+(install|default|toolchain|override)' }
 message = """
 This profile has no rustup. The Rust toolchain comes from FENIX
@@ -397,7 +426,7 @@ second toolchain owner. To change the toolchain, edit the flake input.
 id = "paths.profile_package_for_build_input"
 priority = 150
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = 'nix\s+profile\s+(add|install).*(openssl|pkg-config|onnxruntime|zlib|sqlite)|PKG_CONFIG_PATH=' }
 message = """
 C build inputs come from a derivation's buildInputs -- never from the user
@@ -419,7 +448,7 @@ CI devshell that already carries pkg-config:
 id = "paths.binary_surface_hardcoded"
 priority = 160
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = '(YZX_ZELLIJ|YZX_YAZI_BIN|YZX_YA|YZX_EDITOR|YZX_MENU_YZX|YZX_OPEN_LOG|YAZELIX_AGENT_LAUNCHER|YAZELIX_PACKAGED_YAZI|YAZELIX_EDITOR|EDITOR|VISUAL|GIT_EDITOR|SHELL)\s*=\s*["\x27]?/' }
 message = """
 This pins a BINARY surface to a path. Upstream locates its own tools through
@@ -432,16 +461,18 @@ tool from the closure that built it and outlives the rebuild that moved it.
 Upstream reads them with a fallback to the bare command name, e.g.
   zellij: nonempty_env("YZX_ZELLIJ").unwrap_or_else(|| "zellij".into())
 so an unset surface is a supported state -- resolution falls back to PATH, which
-the profile owns. Read the surface; let nix set it.
+the profile owns. Read the surface; let nix set it, or just call the bare
+command name and let the profile's PATH resolve it.
 
-Approve inside a nix expression that is legitimately producing the value.
+A .nix file may set these freely -- that is the derivation producing the value,
+and this rule does not fire there.
 """
 
 [[patterns]]
 id = "paths.tmpdir_hardcoded"
 priority = 140
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = '(^|["\x27=\s])/tmp/[A-Za-z0-9._-]' }
 message = """
 This writes to /tmp directly. Use $TMPDIR for scratch files when the program
@@ -451,14 +482,15 @@ Upstream Yazelix state resolution has a distinct literal last-resort fallback:
 /tmp/yazelix. That fallback does not honour $TMPDIR; set YAZELIX_STATE_DIR or
 XDG_DATA_HOME when state must resolve elsewhere.
 
-Approve for genuinely throwaway inspection.
+For a scratch file, write under $TMPDIR rather than naming /tmp yourself:
+  nu -> ($env.TMPDIR | path join "name")    sh -> "$TMPDIR/name"
 """
 
 [[patterns]]
 id = "paths.config_surface_hardcoded"
 priority = 160
 enabled = true
-decision = "ask"
+decision = "deny"
 matcher = { type = "regex", pattern = '(YAZELIX_HELIX_MANAGED_CONFIG_PATH|YAZELIX_HELIX_BRIDGE|YAZELIX_NIX_STORE_ROOT|YAZELIX_STATUS_BAR_CACHE_PATH|YAZELIX_CURSOR_CONFIG|YZX_YAZI_STARSHIP_CONFIG|HELIX_STEEL_CONFIG|LG_CONFIG_FILE)\s*=\s*["\x27]?/' }
 message = """
 This pins a Yazelix-owned config or runtime-path surface. Yazelix defines these
@@ -470,8 +502,100 @@ not with an arbitrary shell command.
   YZX_YAZI_STARSHIP_CONFIG            HELIX_STEEL_CONFIG
   LG_CONFIG_FILE
 
-Read the surface. Approve inside the Yazelix source or runtime layer that
-legitimately produces the value.
+Read the surface. A .nix file may set these freely -- that is the Yazelix
+source layer producing the value, and this rule does not fire there.
+"""
+
+# ── install law ─────────────────────────────────────────────────────────────
+#
+# One profile owns every binary. A tool arrives by being DECLARED, not by being
+# installed: a flake input pinned to an exact commit, a packaging derivation, a
+# frontdoor wrapper, an entry in the executables map, and a contract test that
+# asserts it exists and behaves. Anything installed outside that pipeline is a
+# second owner -- it survives no rebuild, appears in no closure, and is invisible
+# to every check that proves this host is reproducible.
+#
+# These rules fire on the SHAPE of an out-of-band install (a package manager
+# asked to place a binary on PATH for the user), and name no directory.
+#
+# The sanctioned cutover is deliberately NOT matched. Installing a project flake
+# OUTPUT is how the profile is built:
+#   nix profile add --refresh --profile <profile> github:<org>/<repo>#<output>
+# What is denied is pulling an INDIVIDUAL package out of the general registry
+# into the profile, which is the drift this section exists to stop.
+
+[[patterns]]
+id = "install.registry_package_into_profile"
+priority = 155
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = 'nix\s+profile\s+(add|install)[^\n]*nixpkgs[#/]|nix-env\s+(-i\b|-iA\b|--install\b)' }
+message = """
+This installs an individual package from the general registry into the user
+profile, creating a binary owner outside the flake closure.
+
+Declare it instead, then rebuild:
+  1. add a pinned input in flake.nix   <name>_source = { url = "github:<org>/<repo>/<sha>"; flake = false; };
+  2. build it in a packaging derivation, with C deps in that derivation's buildInputs
+  3. register it in the executables map so it lands in the profile toolbin
+  4. add a contract test asserting the binary exists and reports its version
+
+Installing the project's own flake OUTPUT is untouched by this rule and remains
+the way to cut over:
+  rtk nix profile add --refresh --profile <profile> github:<org>/<repo>#<output>
+To just run something once without owning it: rtk nix run nixpkgs#<pkg> -- <args>
+"""
+
+[[patterns]]
+id = "install.cargo_install"
+priority = 155
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = 'cargo\s+(\+\S+\s+)?install\b' }
+message = """
+cargo install writes a binary into the cargo home's bin directory, which no
+rebuild reproduces and no closure records -- a second owner competing with the
+profile.
+
+To run a crate you are developing, do not install it:
+  rtk cargo run --bin <name> -- <args>
+  rtk cargo build --release   then run the produced binary from the target dir
+     (ask cargo where that is: rtk cargo metadata --format-version 1 --no-deps)
+To make a tool permanently available, declare it: pin it as a flake input, build
+it in a packaging derivation, and let the profile install it.
+"""
+
+[[patterns]]
+id = "install.global_node_package"
+priority = 155
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(npm|pnpm|bun)\s+(i|in|install|add)\b[^\n]*\s(-g|--global)\b|yarn\s+global\s+add\b' }
+message = """
+A global node install places a binary in a node prefix outside the profile --
+a second owner, and one that a rebuild silently reverts.
+
+Run it without installing (works for one-off tooling):
+  rtk npx <tool> <args>
+  rtk pnpm dlx <tool>@latest <args>
+Project dependencies belong in the project: rtk npm install <pkg> (no -g).
+To make a tool permanent, declare it as a flake input and let the profile own it.
+"""
+
+[[patterns]]
+id = "install.user_site_package"
+priority = 155
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = 'pip3?\s+install\b[^\n]*--user\b|pipx\s+install\b|uv\s+tool\s+install\b|go\s+install\b' }
+message = """
+This installs a binary into a per-user location outside the profile, which no
+rebuild reproduces.
+
+Run it without owning it:
+  python -> rtk uvx <tool> <args>     (or run inside a project virtualenv)
+  go     -> rtk go run <package> <args>
+To make it permanent, declare it as a flake input and let the profile own it.
 """
 
 # ── RTK frontdoor ───────────────────────────────────────────────────────────
