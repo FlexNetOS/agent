@@ -1103,3 +1103,4 @@ To make it permanent, declare it as a flake input and let the profile own it.
 # "tools that need the prefix" was the wrong shape -- it silently permits every
 # command nobody remembered to list, which is the same hole the rule exists to
 # close.
+
