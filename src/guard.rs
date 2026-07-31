@@ -2780,6 +2780,20 @@ message = "medium priority"
     }
 
     #[test]
+    fn install_law_requires_flake_completion_for_runtime_dependencies() {
+        let policy = include_str!("../policy/agent-guard.toml");
+        for requirement in [
+            "This is a completion invariant, not a recommendation.",
+            "the same change must wire it into flake.nix/flake.lock",
+            "profile executable/configuration graph",
+            "manifests remain authoritative",
+            "An npm/package manifest update is only the project dependency half.",
+        ] {
+            assert!(policy.contains(requirement), "missing closure requirement: {requirement}");
+        }
+    }
+
+    #[test]
     fn ruvnet_node_artifacts_use_npmjs_and_meta_ruvector_stays_native() {
         for cmd in [
             "git clone https://github.com/ruvnet/RuVector.git",

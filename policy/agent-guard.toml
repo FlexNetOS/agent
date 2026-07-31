@@ -942,6 +942,15 @@ edit and does not trip this rule; adding or keeping one does.
 # second owner -- it survives no rebuild, appears in no closure, and is invisible
 # to every check that proves this host is reproducible.
 #
+# This is a completion invariant, not a recommendation. A Cargo.toml/Cargo.lock
+# or package.json/bun.lock update alone does not make a runtime dependency
+# Yazelix-owned. If the dependency is required by the Yazelix runtime or profile,
+# the same change must wire it into flake.nix/flake.lock, its derivation, the
+# profile executable/configuration graph, and a contract test. Native project
+# manifests remain authoritative for project dependency resolution; they are not
+# a substitute for the Yazelix closure when the dependency becomes a runtime
+# tool, binary, database, agent, or toolchain.
+#
 # These rules fire on the SHAPE of an out-of-band install (a package manager
 # asked to place a binary on PATH for the user), and name no directory.
 #
@@ -1056,6 +1065,11 @@ To run a crate you are developing, do not install it:
      (ask cargo where that is: rtk cargo metadata --format-version 1 --no-deps)
 To make a tool permanently available, declare it: pin it as a flake input, build
 it in a packaging derivation, and let the profile install it.
+
+An npm/package manifest update is only the project dependency half. If the
+package is needed by Yazelix itself, wire the exact release into flake.nix and
+flake.lock, package it into the closure, expose it through the profile graph,
+and add the contract test; otherwise the runtime dependency is incomplete.
 """
 
 [[patterns]]
