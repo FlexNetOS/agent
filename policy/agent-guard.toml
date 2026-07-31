@@ -633,6 +633,19 @@ documented committer.
 #                      upstream does not have (see paths.session_env_ownership and
 #                      paths.build_state_on_runtime_dir).
 #
+# 14 ALL BINARIES      OWNER LAW: ALL binaries are Yazelix owned. Upstream's
+#    YAZELIX OWNED     pattern is the flake-owned package graph, the package
+#                      selected by the Home Manager module, and the prepared
+#                      PATH applied at the single runtime boundary. The
+#                      FlexNetOS fork extends that same pattern with one tested
+#                      foundation closure containing every profile-facing
+#                      binary, including the canonical runner frontdoor and
+#                      database binaries. A host, global, per-user, downloaded,
+#                      or hash-pinned binary is a competing owner; the install
+#                      and path-law rules below deny those shapes. Do not weaken
+#                      this law into “most binaries”, and do not misattribute the
+#                      fork's runner or databases to upstream.
+#
 # ── FlexNetOS additions: this fork owns these, upstream does not ────────────
 #
 # Kept separate on purpose. Attributing a fork behaviour to upstream is a
