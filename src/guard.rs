@@ -3061,11 +3061,11 @@ message = "medium priority"
         // Where a cache lives is configuration. It belongs to its proved owner,
         // not to a policy that ships everywhere.
         for local_policy in [
-            "export HF_HOME=/run/user/1001/hf",
+            "export HF_HOME=/run/user/4242/hf",
             "export TORCH_HOME=$XDG_RUNTIME_DIR/torch",
-            "export PLAYWRIGHT_BROWSERS_PATH=/run/user/1001/pw",
-            "export STARSHIP_CACHE=/run/user/1001/starship",
-            "export KACHE_CACHE_DIR=/run/user/1001/kache",
+            "export PLAYWRIGHT_BROWSERS_PATH=/run/user/4242/pw",
+            "export STARSHIP_CACHE=/run/user/4242/starship",
+            "export KACHE_CACHE_DIR=/run/user/4242/kache",
             "export UV_CACHE_DIR=/some/uv",
             "export npm_config_cache=/some/npm",
             "export DENO_DIR=/some/deno",
