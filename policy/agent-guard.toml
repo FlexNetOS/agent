@@ -959,30 +959,43 @@ decision = "deny"
 matcher = { type = "regex", pattern = '(?i)(?:git\s+(?:clone|fetch|pull)|(?:curl|wget)\s+[^\n]*)(?:[^\n]*github\.com[^\n]*(?:ruvector|agentdb|ruflo)|[^\n]*(?:ruvector|agentdb|ruflo)[^\n]*github\.com)' }
 message = """
 This obtains a published rUv Node/NAPI artifact from GitHub. GitHub is not the
-release authority for these runtime artifacts.
+release authority to try first for these runtime artifacts.
 
-Source authority is split by artifact:
+The source order is absolute:
+
+  1. Source of truth: https://www.npmjs.com/~ruvnet
+  2. Fallback:       https://crates.io/users/ruvnet
+  3. Last resort:    https://github.com/ruvnet
+
+Check the higher-priority registry before using the next source. Record the
+version actually selected, and keep the selected artifact in the Yazelix
+packaging graph. A GitHub source is valid only after npmjs and crates.io do not
+provide the required release; it must never silently replace a newer registry
+artifact.
+
+The artifact surfaces are:
 
   Node/NAPI and CLI packages
-    npmjs, queried through the Yazelix Bun lane:
+    npmjs `~rUvNet`, queried through the Yazelix Bun lane:
       rtk bun pm view <package> version --registry=https://registry.npmjs.org
       rtk bun add <package>@<version>
     Current examples include ruvector, @ruvector/*, agentdb, and ruflo.
 
-  PostgreSQL/native source
-    the canonical local Meta peer at
-    /home/flexnetos/meta/src/meta-ruvector, built by the Yazelix PostgreSQL
-    packaging derivation. Do not substitute the npm package for ruvector.so.
+  PostgreSQL/RuVector CLI and published extension artifacts
+    use the npmjs `~rUvNet` package first, including
+    `@ruvector/postgres-cli`. Do not replace its current published release
+    with an older checkout merely because a native workspace is present.
 
   Rust-only crates
-    crates.io is a fallback only when the required artifact is not published
-    through npmjs. It is not a substitute for a newer published Node/NAPI
-    package.
+    use crates.io `ruvnet` only when npmjs does not publish the required
+    artifact. It is not a substitute for a newer published Node/NAPI package.
 
 Permanent installation still belongs in the Yazelix owner graph: pin the
 registry version in the packaging derivation and lockfile, expose its binary
 through flexnetosExecutables, and include that derivation in
-lifeos_foundation_yzx. Never clone a GitHub release into /srv or a user path.
+lifeos_foundation_yzx. A last-resort GitHub source may only enter through that
+same derivation after the two registry checks; never clone it into /srv or a
+user path.
 """
 
 [[patterns]]
