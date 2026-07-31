@@ -23,7 +23,13 @@ use std::sync::OnceLock;
 // ── Configuration ───────────────────────────────────────
 
 /// Default agent guard configuration embedded in the binary.
-const DEFAULT_CONFIG: &str = include_str!("../.claude/agent-guard.toml");
+// The canonical policy ships at a non-overlay path. It used to live in this
+// repository's agent-overlay directory, which meant the Yazelix flake installed it
+// by reaching into that directory -- a reference the source-ownership gate matched,
+// correctly, as an agent overlay. The overlay directory remains what
+// `load_from_project` reads as a PER-PROJECT override; it is no longer where this
+// repository ships its own policy.
+const DEFAULT_CONFIG: &str = include_str!("../policy/agent-guard.toml");
 
 /// Cached compiled patterns loaded once per process.
 /// This avoids repeated file I/O, TOML parsing, and regex compilation.
@@ -946,16 +952,15 @@ pub fn evaluate_path_law(text: &str) -> Option<DenyReason> {
 /// dotlocal_tool_state or build_state_on_runtime_dir, which are wrong wherever
 /// they appear, nor from nix_store_hardcoded, whose message tells a nix author
 /// to reference the derivation rather than pin a hash.
+// A .nix file is entitled to PRODUCE a surface value, because a derivation is the
+// builder. That entitlement does not extend to authoring a packaged config layer
+// upstream does not have: the flake is exactly where this fork's extra layer is
+// declared, so exempting .nix there would make the rule unable to reach the thing
+// it exists to stop.
 const NIX_AUTHORED_SURFACE_RULES: &[&str] = &[
     "paths.yazelix_surface_hardcoded",
     "paths.binary_surface_hardcoded",
     "paths.config_surface_hardcoded",
-    // The packaged-layer rule keys on a `nushell/**.nu` destination appearing in
-    // the payload, but a flake references those very paths while installing them
-    // and carries `mkdir` in almost every derivation -- so without this entry the
-    // rule fires on ordinary flake edits. A derivation is the builder that
-    // produces the packaged layer; the rule targets host config authored INTO it.
-    "paths.yazelix_packaged_config_layer",
 ];
 
 pub fn evaluate_path_law_for_target(text: &str, target: Option<&str>) -> Option<DenyReason> {
