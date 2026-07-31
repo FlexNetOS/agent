@@ -976,13 +976,13 @@ artifact.
 The artifact surfaces are:
 
   Node/NAPI and CLI packages
-    npmjs `~rUvNet`, queried through the Yazelix Bun lane:
+    npmjs `~ruvnet`, queried through the Yazelix Bun lane:
       rtk bun pm view <package> version --registry=https://registry.npmjs.org
       rtk bun add <package>@<version>
     Current examples include ruvector, @ruvector/*, agentdb, and ruflo.
 
   PostgreSQL/RuVector CLI and published extension artifacts
-    use the npmjs `~rUvNet` package first, including
+    use the npmjs `~ruvnet` package first, including
     `@ruvector/postgres-cli`. Do not replace its current published release
     with an older checkout merely because a native workspace is present.
 
