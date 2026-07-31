@@ -506,6 +506,44 @@ Read the surface. A .nix file may set these freely -- that is the Yazelix
 source layer producing the value, and this rule does not fire there.
 """
 
+[[patterns]]
+id = "paths.yazelix_packaged_config_layer"
+priority = 161
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(?m)nushell/[^\n]*\.nu[\s\S]*(\$env\.(XDG_|YAZELIX_|CARGO_|TMPDIR|TMP|TEMP)\w*\s*=|^\s*mkdir\s)' }
+message = """
+This writes host configuration into a PACKAGED Nushell layer. Upstream Yazelix
+ships exactly two Nu files -- defaults/nu/config.nu (prompt only) and
+defaults/nu/env.nu (one line) -- and sets no paths and creates no directories in
+either. Host configuration belongs in the user config root, which upstream
+documents as loading AFTER the packaged layer.
+
+Upstream's config layering is: packaged first, unless a surface opts into
+native replacement.
+
+  $YAZELIX_CONFIG_HOME/
+    config.toml              # optional sparse semantic overrides
+    cursors.toml             # shared cursor selection/effects; seeded once
+    mars/config.toml         # optional sparse Mars overrides
+    zellij/config.kdl        # guarded scalar sidecar
+    zellij/plugins.kdl       # extra plugins only
+    starship.toml            # optional sparse prompt overrides
+    nu/{env,config}.nu       # after packaged Nu
+    helix/*                  # lazy; created on tab use
+    yazi/{yazi.toml,theme.toml,package.toml,starship.toml,init.lua,keymap.toml,plugins/,flavors/}
+
+The root resolves YAZELIX_CONFIG_HOME -> $XDG_CONFIG_HOME/yazelix ->
+~/.config/yazelix. Runtime state defaults to $XDG_DATA_HOME/yazelix or
+YAZELIX_STATE_DIR.
+
+Put the surface assignment or the directory creation in
+$YAZELIX_CONFIG_HOME/nu/env.nu, not in the packaged layer. Relocating it from
+one packaged file to another packaged file is the same violation. A .nix file
+may produce these values freely -- that is the source layer building the
+package, and this rule does not fire there.
+"""
+
 # ── install law ─────────────────────────────────────────────────────────────
 #
 # One profile owns every binary. A tool arrives by being DECLARED, not by being

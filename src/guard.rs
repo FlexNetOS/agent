@@ -950,6 +950,12 @@ const NIX_AUTHORED_SURFACE_RULES: &[&str] = &[
     "paths.yazelix_surface_hardcoded",
     "paths.binary_surface_hardcoded",
     "paths.config_surface_hardcoded",
+    // The packaged-layer rule keys on a `nushell/**.nu` destination appearing in
+    // the payload, but a flake references those very paths while installing them
+    // and carries `mkdir` in almost every derivation -- so without this entry the
+    // rule fires on ordinary flake edits. A derivation is the builder that
+    // produces the packaged layer; the rule targets host config authored INTO it.
+    "paths.yazelix_packaged_config_layer",
 ];
 
 pub fn evaluate_path_law_for_target(text: &str, target: Option<&str>) -> Option<DenyReason> {
