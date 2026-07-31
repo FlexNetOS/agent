@@ -506,6 +506,56 @@ Read the surface. A .nix file may set these freely -- that is the Yazelix
 source layer producing the value, and this rule does not fire there.
 """
 
+# ── yazelix upstream direction ──────────────────────────────────────────────
+#
+# Verified against upstream/main 78d18c94 (luccahuguet/yazelix). This is what
+# upstream DIRECTS, or what its pattern shows. The fork diverges from every line
+# below, so a remedy that contradicts one of them is wrong before it is run.
+#
+# HARDCODED PATHS    Upstream owns none. A whole-tree search for absolute /home,
+#                    /usr, /opt and /srv literals returns exactly one hit, and it
+#                    is a discovery CANDIDATE list, not an owned path
+#                    (crates/yzx-open/src/main.rs, alongside hx/helix/nvim).
+#                    Paths are resolved through a chain, never asserted.
+#
+# CARGO AND FENIX    Upstream sets NO cargo home and NO cargo target dir
+#                    anywhere. Fenix IS upstream but arrives TRANSITIVELY: it is
+#                    absent from the 14 root inputs and enters through component
+#                    flakes (yazelixHelix, yazelixScreen, yazelixZellijBar,
+#                    yazelixZellijPaneOrchestrator). Read flake.lock nodes, not
+#                    flake.nix declarations, before claiming what is upstream.
+#
+# AGENT CONFIG       Semantic keys in config.toml, never a config tree:
+#                    agent.command (executable string or "auto"; default "auto"),
+#                    agent.args, keybindings.agent. runtime/yzx-agent.rs
+#                    bootstraps providers BY NAME. Agents are COMMANDS.
+#
+# AGENT HOMES        Upstream ships ZERO agent config directories and no agents/
+#                    path of any kind. An agent home is that agent's own surface,
+#                    owned by the agent, never carried inside yazelix.
+#
+# ACTIVE CONFIG      crates/yzx-config/src/paths.rs config_paths() builds every
+#                    active path from home.join(..) under the config root:
+#                    config.toml, cursors.toml, mars/config.toml,
+#                    zellij/config.kdl, helix/*, nu/env.nu. The same module
+#                    carries is_home_manager_owned() and reject_mutation(), which
+#                    REFUSE to mutate a generated file and name the owning option
+#                    instead of writing it.
+#
+# NUSHELL ENV        Packaged first, user after. Upstream ships exactly two Nu
+#                    files and sets no paths and creates no directories in
+#                    either. The generated runtime env.nu does a source-env of
+#                    the USER's nu/env.nu, whose starter text is literally
+#                    "Loaded after Yazelix Nova packaged env.nu"
+#                    (crates/yzx-config/src/catalog.rs, NU_ENV_STARTER).
+#
+# ADDING A TOOL      home.packages in the flake and in the home-manager module
+#                    (home-manager/module.nix: home.packages = [cfg.package]).
+#
+# DATABASE           Upstream ships none -- no postgres, sqlite or redb appears
+#                    in any upstream .nix. Binaries arrive from the store through
+#                    packages, never from a host install.
+
 [[patterns]]
 id = "paths.yazelix_packaged_config_layer"
 priority = 161
