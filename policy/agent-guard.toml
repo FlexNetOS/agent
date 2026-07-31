@@ -5,24 +5,56 @@
 #   CANONICAL: Meta's tracked .claude/agent-guard.toml. Meta is the workspace
 #     control plane and owns its tracked policy.
 #   MIRROR (traceable, byte-identical): the `agent` peer's
-#     .claude/agent-guard.toml, compiled into the `agent` binary as its embedded
-#     default fallback.
+#     policy/agent-guard.toml, which src/guard.rs pulls in with
+#     include_str!("../policy/agent-guard.toml") as the embedded default
+#     fallback. That path -- policy/, not .claude/ -- is the one the binary
+#     actually compiles; the two copies diverged once while this line named the
+#     wrong file, and each half of the drift then looked authoritative.
 #   ADAPTERS may refine parsing on their own hook routes, but may not become a
 #     policy source or override these decisions.
 #
 # Load hierarchy of the engine: ./.claude/agent-guard.toml (project) ->
-# ~/.claude/agent-guard.toml (user) -> embedded default. All policy copies used
-# for this workspace must carry this consolidated content; a project-level fork
-# is a policy fork and must be treated as an incident.
+# $CLAUDE_CONFIG_DIR/agent-guard.toml (user) -> embedded default. All policy
+# copies used for this workspace must carry this consolidated content; a
+# project-level fork is a policy fork and must be treated as an incident.
+#
+# The user-level copy is GENERATED and has exactly one owner. The flake installs
+# the mirror as share/yazelix/agent_configs/claude/agent-guard.toml.src, and the
+# Claude frontdoor writes it into the Claude home at startup. So it lags this
+# file by one profile rebuild BY DESIGN, and hand-editing it creates a second
+# owner of a generated file. To refresh it, land the change here, bump the
+# agent input pin, and rebuild the profile -- never edit the copy in place.
+#
+# That lag is not harmless, and it has already cost a test. `cargo test` in the
+# `agent` repo runs with no project policy in its working directory, so it fell
+# through to that generated copy and asserted the behaviour of the PREVIOUS
+# policy: a new rule was invisible to the suite, and a test contradicting it
+# kept passing. GuardConfig::load() now short-circuits to the embedded default
+# under cfg(test), so the suite tests the policy the crate ships. When a rule
+# seems not to fire, print which file was loaded before concluding anything.
 #
 # envctl has no authority over this policy. Do not infer authority from a local
 # projection, a generated file, or a tool being present on this host.
 #
-# NUSHELL-ONLY AGENT PLANE (YZXCONV-017): agents execute shell actions only
-# through the profile-owned Nushell; Bash/sh/zsh/fish/xonsh are owner-only, with
-# a per-incident owner-approved emergency fallback solely after a system crash.
-# This policy file adds no alternate-shell permission; launcher/hook enforcement
-# of the shell boundary is YZXCONV-017 scope and must not be weakened here.
+# RTK FRONTDOOR — MANDATORY. All Claude shell work enters through the
+# profile-owned RTK binary, and the Claude PreToolUse hook routes Bash-tool
+# requests through `rtk hook claude`. Agents always use bash through RTK: the
+# Bash tool is the agent's shell interface, and every segment of every command
+# carries the `rtk` prefix. Do not bypass that hook with an alternate binary,
+# shell owner, or raw payload.
+#
+# RTK is the frontdoor, not the shell owner. It reaches the profile-owned
+# Nushell through `rtk proxy -- /home/<user>/.nix-profile/toolbin/nu -l -c
+# "command"`, which is also the documented escape hatch for a command that is
+# genuinely unfilterable. Substituting sh/zsh/fish/xonsh as the shell owner is
+# the bypass this paragraph forbids; using the Bash tool with the rtk prefix is
+# the sanctioned path and always was. An earlier draft of this paragraph read
+# "Bash/sh/zsh/fish/xonsh are owner-only", which contradicted the frontdoor rule
+# this same policy enforces and the RTK.md instruction it is derived from.
+#
+# Enforcement is deny-by-default and lives in evaluate_rtk_frontdoor() in
+# src/guard.rs, because it must match a segment whose first token is NOT rtk and
+# the regex crate has no lookahead.
 #
 # Decision semantics: "deny" blocks the tool call AND returns the reason to the
 # model; "ask" escalates to the operator. Unknown values fail closed to "deny".
@@ -46,6 +78,14 @@
 # A denial that only says "no" strands the agent and costs a human round trip;
 # a denial that says "use this instead" is self-correcting. When adding a rule,
 # write the remedy first and the prohibition second.
+#
+# The guard is not a brake on auto mode; it is what makes auto mode safe. It is
+# not designed to block auto mode, and it never asks the user a question. Its
+# job is to hold the user's already-stated intent when a session drifts from it,
+# so the user never has to answer for the same decision twice. No human in the
+# loop is the standard here, not the exception. That is why a rule's message is
+# addressed to the MODEL and always names the compliant command: the denial has
+# to carry everything the session needs to correct itself unattended.
 
 schema_version = "1.1"
 
@@ -64,6 +104,9 @@ decision = "deny"
 matcher = { type = "regex", pattern = '--dangerously-skip-permissions' }
 message = """
 LAW: --dangerously-skip-permissions is forbidden on this machine, no exceptions.
+Continue in the current session. The only permitted Claude CLI diagnostics are:
+  rtk claude --version
+  rtk claude doctor
 """
 
 [[patterns]]
@@ -75,8 +118,9 @@ matcher = { type = "regex", pattern = '^\s*(rtk\s+|sudo\s+)?claude(\s|$)' }
 validator = { type = "all_of", validators = [{ type = "not_contains", value = "--version" }, { type = "not_contains", value = "claude update" }, { type = "not_contains", value = "claude doctor" }] }
 message = """
 Nested Claude sessions are denied (recursion containment). Allowed:
-'claude --version', 'claude update', 'claude doctor'. Use teams/subagents/background
-bash instead. (Baseline rule; guard-bash.sh refines with quote-aware parsing.)
+`rtk claude --version`, `rtk claude update`, `rtk claude doctor`. Use the
+current session's teams/subagents/background work instead of starting another
+Claude process. (Baseline rule; guard-bash.sh refines with quote-aware parsing.)
 """
 
 # ── git topology protection ─────────────────────────────────────────────────
@@ -91,6 +135,8 @@ validator = { type = "args_match_any", command = "push", values = ["main", "mast
 message = """
 Force-push (any variant, including --force-with-lease and +refspec) touching
 main/master/develop is forbidden — long-lived branches are upgrade-only history.
+Reconcile and publish an additive commit instead:
+  rtk git pull --rebase origin <branch> && rtk git push origin <branch>
 """
 
 [[patterns]]
@@ -102,10 +148,10 @@ matcher = { type = "regex", pattern = 'git\s+push.*(--force|-f)\b' }
 validator = { type = "not_contains", value = "--force-with-lease" }
 message = """
 git push --force in a multi-repo workspace can overwrite history across \
-multiple repos. Safer alternatives:
-- git push --force-with-lease on a private feature branch (operator-approved)
-- meta --include <repo> exec -- git push (target one repo)
-- meta git snapshot create <name> before risky pushes
+multiple repos. Reconcile or publish without rewriting:
+- rtk git pull --rebase origin <branch> && rtk git push origin <branch>
+- rtk git push origin HEAD:refs/heads/<new-branch>
+- rtk meta git snapshot create <name>
 """
 
 [[patterns]]
@@ -145,6 +191,8 @@ matcher = { type = "regex", pattern = 'git\s+branch.*\s+-[a-zA-Z]*D[a-zA-Z]*(\s|
 validator = { type = "args_match_any", command = "branch", values = ["main", "master", "develop"] }
 message = """
 Topology invariant: main/master/develop are long-lived and never force-deleted.
+Inspect the branch and leave the long-lived ref intact:
+  rtk git branch -v
 """
 
 [[patterns]]
@@ -156,9 +204,9 @@ matcher = { type = "regex", pattern = 'git\s+branch.*\s+-[a-zA-Z]*D[a-zA-Z]*(\s|
 message = """
 git branch -D force-deletes branches, potentially losing unmerged work. \
 Safer alternatives:
-- git branch -d <branch> (safe delete — only works if merged)
-- git branch -v to check merge status first
-- meta git snapshot create <name> before deleting
+- rtk git branch -d <branch> (safe delete — only works if merged)
+- rtk git branch -v
+- rtk meta git snapshot create <name>
 """
 
 [[patterns]]
@@ -169,7 +217,8 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'git[-\s]+filter-branch|git[-\s]+filter-repo|git\s+reflog\s+expire.*--expire|git\s+gc\b.*--prune=now' }
 message = """
 History rewrites / reflog destruction are forbidden (LAW 1 + upgrade-only).
-Archive instead.
+Archive instead:
+  rtk meta git snapshot create <name>
 """
 
 [[patterns]]
@@ -181,8 +230,8 @@ matcher = { type = "regex", pattern = 'git\s+reset.*--hard\b' }
 message = """
 git reset --hard destroys uncommitted work. In a multi-repo workspace, \
 this can silently discard changes across repos. Safer alternatives:
-- meta git snapshot create <name> (save state first)
-- meta git snapshot restore <name> (reversible reset)
+- rtk meta git snapshot create <name> (save state first)
+- rtk meta git snapshot restore <name> (reversible reset)
 """
 
 [[patterns]]
@@ -195,8 +244,8 @@ validator = { type = "flags_present", command = "clean", flags = ["f", "d"] }
 message = """
 git clean -fd removes untracked files and directories permanently. \
 Safer alternatives:
-- git clean -nd (dry run — preview what would be removed)
-- meta git snapshot create <name> before cleaning
+- rtk git clean -nd (dry run — preview what would be removed)
+- rtk meta git snapshot create <name> before cleaning
 """
 
 [[patterns]]
@@ -207,8 +256,8 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'git\s+checkout\s+(--\s+)?\.(\s|$)' }
 message = """
 git checkout . reverts all modified files. Safer alternatives:
-- git checkout -- <specific-file> (target specific files)
-- meta git snapshot create <name> before reverting
+- rtk git checkout -- <specific-file> (target specific files)
+- rtk meta git snapshot create <name> before reverting
 """
 
 [[patterns]]
@@ -219,9 +268,9 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'git\s+stash\s+drop\b' }
 message = """
 git stash drop permanently removes a stash entry. Safer alternatives:
-- git stash list to review what will be dropped
-- git stash show <stash> to inspect contents first
-- git stash apply <stash> instead of pop (preserves the stash)
+- rtk git stash list
+- rtk git stash show <stash>
+- rtk git stash apply <stash> (preserves the stash)
 """
 
 [[patterns]]
@@ -232,9 +281,9 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'git\s+stash\s+clear\b' }
 message = """
 git stash clear removes ALL stash entries permanently. Safer alternatives:
-- git stash list to review what will be cleared
-- git stash drop <stash> to remove specific entries one at a time (guarded)
-- meta git snapshot create <name> before clearing (captures all stashes)
+- rtk git stash list
+- rtk git stash drop <stash> (guarded, one entry at a time)
+- rtk meta git snapshot create <name> (captures all stashes)
 """
 
 # ── filesystem protection ───────────────────────────────────────────────────
@@ -249,9 +298,9 @@ validator = { type = "all_of", validators = [{ type = "flags_present", command =
 message = """
 rm -rf on dangerous paths could destroy repo roots or workspace data. \
 LAW 1: never delete, always archive. Safer alternatives:
-- Remove specific scratch files instead of entire directories
-- meta --dry-run exec -- <cmd> to preview operations
-- meta git snapshot create <name> before destructive operations
+- rtk git status --short (identify the exact scratch targets)
+- rtk meta --dry-run exec -- <cmd> (preview the scoped operation)
+- rtk meta git snapshot create <name>
 (Hook adapters may apply parser refinements, but this policy remains the
 decision source.)
 """
@@ -268,10 +317,24 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'rm(?:\s+[-\w=]+)*\s+(?:["\x27]?(?:(?:\./|\.\./)|(?:[^\s"\x27]+/))*["\x27]?)?\.meta(?:["\x27]?\.ya?ml)?["\x27]?(?:/)?(?:\s|$)' }
 message = """
 Deleting a protected Meta manifest is forbidden. Preserve control-plane
-metadata; use a reviewed migration or archive workflow instead.
+metadata. Inspect and snapshot it before a reviewed migration:
+  rtk git diff -- .meta .meta.yaml .meta.yml
+  rtk meta git snapshot create <name>
 """
 
 # ── path law ────────────────────────────────────────────────────────────────
+#
+# PATH LAW IS ABSOLUTE. All paths follow upstream Yazelix. No loopholes, no
+# exceptions, and no per-tool carve-outs -- an exception carved for one variable
+# is how the last violation survived five sessions. It binds every agent and
+# every tool equally: the rules below are the only ones evaluated against file
+# payloads as well as commands, so a forbidden path is forbidden whichever tool
+# writes it (evaluate_path_law_for_target in src/guard.rs, and the `cmd` field
+# so Codex is covered on the same terms as Claude).
+#
+# The one entitlement is narrow and structural, not a loophole: a `.nix` file
+# may PRODUCE a surface's value, because a derivation is the builder. That
+# covers exactly three rules (NIX_AUTHORED_SURFACE_RULES) and nothing else.
 #
 # SOURCING LAW, and the reason this section exists at all:
 #
@@ -359,7 +422,7 @@ is cleared on logout -- a workspace build reached 30G there and drove it to 84%.
 The symptom is a binary that "does not exist" right after cargo reports success.
 Use the durable surface: $CARGO_HOME / $CARGO_TARGET_DIR are already exported.
 Never assume ./target either -- ask cargo where it actually put things:
-  cargo metadata --format-version 1 --no-deps | jq -r .target_directory
+  rtk cargo metadata --format-version 1 --no-deps | rtk jq -r .target_directory
 $XDG_RUNTIME_DIR is correct for genuinely disposable caches, and only those.
 """
 
@@ -387,6 +450,330 @@ Everywhere else, read the surface instead of setting it:
   nu   -> $env.XDG_DATA_HOME          sh -> "$XDG_DATA_HOME"
 Never hand-edit the owner's live configuration table; use that owner's
 documented committer.
+"""
+
+# ── upstream Yazelix: what it directs ───────────────────────────────────────
+#
+# Read against upstream/main (luccahuguet/yazelix) at 81cfbfaf on 2026-07-31 --
+# by reading the tree, not by recalling it. These are answers the project already
+# published, so do not re-derive them, do not re-litigate them, and never ask the
+# user a question one of them already answers. Each line was paid for once by an
+# agent that invented instead of reading. The fork diverges from most of them, so
+# a remedy that contradicts one is wrong before it is run.
+#
+# GOVERNANCE, quoted from upstream AGENTS.md:
+#
+#   Core Rule       "The user decides scope. Do not create a feature,
+#                   compatibility surface, module, or planning bead until the
+#                   user has chosen that direction"
+#   Method 3 and 6  "Choose one owner in this repo" / "Avoid duplicate owners,
+#                   adapters, generated fixtures, and compatibility shims"
+#   Git workflow    "Work directly on `main` by default. Do not create a
+#                   separate branch unless the user explicitly requests one or
+#                   another repository instruction requires it." `stable` is "a
+#                   promotion-only user channel", advanced only by pushing an
+#                   exact verified SHA -- "git push origin <sha>:stable; never
+#                   force-push or delete `stable`" -- and rolled back with a new
+#                   revert commit on main, never a rewrite
+#
+#  1 HARD-CODED PATHS  Upstream has no host-placement literal acting as a
+#                      runtime/config owner. A controlled whole-tree search does
+#                      find absolute literals in CI cleanup, maintainer and docs
+#                      examples, architecture prose, and executable candidate
+#                      tests. Those are evidence or candidates, not placement
+#                      authority. The startup boundary is "Owned by runtime/yzx/
+#                      (Nix substitutes paths; Rust owns wiring and exec)":
+#                      literals are produced by the derivation, and every surface
+#                      is a precedence chain, never an assignment
+#                      (runtime/yzx/paths.rs):
+#                        config  YAZELIX_CONFIG_HOME -> $XDG_CONFIG_HOME/yazelix
+#                                -> $HOME/.config/yazelix, else a startup error
+#                        state   YAZELIX_STATE_DIR -> $XDG_DATA_HOME/yazelix
+#                                -> $HOME/.local/share/yazelix, ending in the
+#                                literal /tmp fallback named in the header above
+#                      Every read goes through nonempty_env(), so EMPTY IS UNSET.
+#
+#  2 CARGO AND FENIX   Upstream sets NO cargo home and NO cargo target dir
+#                      anywhere, and ships no rust-toolchain file. Fenix IS
+#                      upstream but arrives TRANSITIVELY: it is absent from all
+#                      14 root inputs and enters through four component flakes --
+#                      yazelixScreen, yazelixZellijBar,
+#                      yazelixZellijPaneOrchestrator, yazelixZellijPopup. Read
+#                      flake.lock NODES, not flake.nix declarations, before
+#                      claiming what is upstream, and derive the list rather than
+#                      recalling it -- an earlier revision of this line named
+#                      yazelixHelix, which takes no fenix input at all:
+#                        jq -r '[.nodes | to_entries[]
+#                                | select(.value.inputs.fenix != null)
+#                                | .key] | sort | .[]' flake.lock
+#                      This fork's flake.nix composes fenix and owns it
+#                      (see paths.rustup_not_used).
+#
+#  3 AGENT CONFIG      Semantic keys in config.toml, never a config tree:
+#                      agent.command (an executable string, or "auto" to keep the
+#                      built-in fallback), agent.args, keybindings.agent.
+#                      runtime/yzx-agent.rs bootstraps providers BY NAME -- codex,
+#                      grok, opencode, pi, claude -- selecting the first that is
+#                      actually on PATH with the executable bit set, then
+#                      remembering the choice as one line in
+#                      <state_dir>/agent/provider. Agents are COMMANDS.
+#
+#  4 RUNTIME CONFIG    One preparer, one application. Runtime::prepare_with()
+#                      (runtime/yzx/runtime.rs) resolves the surfaces, creates the
+#                      state dir, and reads every semantic value through the
+#                      yzx-config helper: open.log_level, shell.program,
+#                      editor.command, agent.command, agent.args, welcome.*,
+#                      appearance.mode, bar.widgets, popup.*, keybindings.
+#                      Runtime::apply() then stamps that one prepared environment
+#                      onto whatever is launched -- YAZELIX_CONFIG_HOME,
+#                      YAZELIX_STATE_DIR, EDITOR, VISUAL, GIT_EDITOR, YZX_EDITOR,
+#                      YZX_OPEN_LOG, YZX_ZELLIJ, YZX_YAZI_BIN, YZX_YA,
+#                      YAZELIX_STATUS_BAR_CACHE_PATH, MARS_CONFIG_HOME, PATH.
+#                      No shell profile, no session tier and no service manager
+#                      appears anywhere in that path.
+#
+#  5 ACTIVE CONFIG     crates/yzx-config/src/paths.rs config_paths() builds every
+#                      active path from home.join(..) under the config root:
+#                      config.toml, cursors.toml, mars/config.toml,
+#                      zellij/config.kdl, zellij/plugins.kdl, starship.toml,
+#                      helix/*, yazi/*, nu/{env,config}.nu. Host
+#                      ~/.config/{helix,yazi,starship} is "Not loaded by default".
+#                      The same module carries is_home_manager_owned() and
+#                      reject_mutation(), which REFUSE to mutate a generated file
+#                      and name the owning option instead of writing it.
+#
+#  6 ADDING A TOOL     home.packages in the flake and in the home-manager module
+#                      (home-manager/module.nix: home.packages = [cfg.package],
+#                      whose option doc reads "The package owns the command and
+#                      any desktop entry it provides"). A new dependency or
+#                      toolchain is a flake input, hacked locally with
+#                      nix run --override-input <name> ../<repo> and proved by
+#                      nix flake check. "flake.nix owns the package graph".
+#
+#  7 .claude AND       Upstream ships AGENTS.md only, and has NO .claude and NO
+#    .codex            .codex tree anywhere in the tree. An agent home is that
+#                      agent's own surface, owned by the agent, never carried
+#                      inside yazelix (see paths.agent_home_shadow).
+#
+#  8 DATABASES AND     Upstream ships no database -- no postgres, sqlite or redb
+#    BINARIES          appears in any upstream .nix. Every binary arrives from the
+#                      store through packages and is reached through the profile
+#                      frontdoor, never by store hash and never from a host
+#                      install (see paths.nix_store_hardcoded).
+#
+#  9 NUSHELL ENV       Packaged first, user after. Upstream ships exactly two Nu
+#                      files -- defaults/nu/config.nu (prompt only) and
+#                      defaults/nu/env.nu (one line) -- and sets no paths and
+#                      creates no directories in either. The generated runtime
+#                      env.nu does a source-env of the USER's nu/env.nu, whose
+#                      starter text is literally "Loaded after Yazelix Nova
+#                      packaged env.nu" (crates/yzx-config/src/catalog.rs,
+#                      NU_ENV_STARTER). The layering is "Packaged -> optional host
+#                      mise activate nu -> optional user Nu". The packaged layer
+#                      is the shell-scope owner. There is no session-scope tier.
+#
+# 10 yzx enter AND     Both use exec_managed() in
+#    yzx launch        runtime/yzx/cli.rs: prepare the runtime with Yazi, build
+#                      the managed Zellij command with the packaged config and
+#                      layout, apply() the whole prepared environment, exec.
+#                      `enter` starts Yazelix in the current terminal; `launch`
+#                      opens Mars and starts the same workspace inside it.
+#                      Upstream stops at that handoff and contains no FlexNetOS
+#                      runner or database integration. The owner's FlexNetOS law
+#                      is stronger: yzx enter and yzx launch launch everything in
+#                      Yazelix, including the runner and databases. That remains
+#                      a fork-owned runtime contract and MUST be proved by a
+#                      behavioral test before anyone says it is implemented.
+#                      Path law is absolute because one prepared environment is
+#                      inherited by every descendant for the life of the
+#                      session; C1 proves the same mechanism for
+#                      `yzx run <program>`.
+#
+# 11 TERMINAL          OWNER LAW: the terminal emulator with the most advanced
+#    EMULATOR          capabilities always wins, proven by test not by guessing.
+#                      Upstream does not implement a generic ranking. It makes
+#                      Mars the first-class packaged GUI used by yzx launch and
+#                      routes host terminals through yzx enter; this fork's
+#                      terminal-support metadata packages and tests Mars as the
+#                      sole launch terminal. Capability is proved at the
+#                      selection boundary:
+#                        - managed_program() REFUSES yzx launch when the package
+#                          omits Mars ("use yzx enter or select a package that
+#                          includes Mars") rather than degrading to a lesser one
+#                        - the desktop entry exists only when Mars is present
+#                          (withDesktop = withMars && isLinux)
+#                        - support_kitty_keyboard_protocol is in
+#                          ZELLIJ_FORBIDDEN_TOP_LEVEL, so the packaged layer owns
+#                          it and a user sidecar cannot downgrade it
+#                        - yzx doctor probes reality: require_file() stats every
+#                          packaged path, require_command() resolves the command
+#                          on the runtime PATH, and the Yazi version is read from
+#                          the binary and compared with YAZI_TESTED_VERSION
+#                      Prove a capability with a probe like those. Never infer one
+#                      from a name, a version string, or a reputation.
+#
+# 12 DESKTOP APP       The desktop entry is produced by the flake, never written
+#                      by hand: pkgs.makeDesktopItem with exec set to the yzx
+#                      command's absolute store path plus `launch`, terminal set
+#                      false, categories System/TerminalEmulator, and
+#                      withDesktop = withMars && isLinux. A GUI launch therefore
+#                      never depends on a session PATH. Configure the GUI through
+#                      the desktop entry the package owns, and the shell through
+#                      managed Nu. Upstream has already answered this; there is no
+#                      third place to invent.
+#
+# 13 NO systemd,       Neither appears upstream AT ALL. A whole-tree search of
+#    NO tmpfs          upstream/main for systemd, environment.d, tmpfs and
+#                      /run/user returns ZERO hits, against a control search that
+#                      returns matches on the same tree. Upstream's only volatile
+#                      fallback is the literal /tmp last resort in state_dir(),
+#                      and reaching it means no surface was set. So a systemd
+#                      unit, an environment.d drop-in, or build state on a runtime
+#                      tmpfs is never "how upstream does it" -- it is a tier
+#                      upstream does not have (see paths.session_env_ownership and
+#                      paths.build_state_on_runtime_dir).
+#
+# 14 ALL BINARIES      OWNER LAW: ALL binaries are Yazelix owned. Upstream's
+#    YAZELIX OWNED     pattern is the flake-owned package graph, the package
+#                      selected by the Home Manager module, and the prepared
+#                      PATH applied at the single runtime boundary. The
+#                      FlexNetOS fork extends that same pattern with one tested
+#                      foundation closure containing every profile-facing
+#                      binary, including the canonical runner frontdoor and
+#                      database binaries. A host, global, per-user, downloaded,
+#                      or hash-pinned binary is a competing owner; the install
+#                      and path-law rules below deny those shapes. Do not weaken
+#                      this law into “most binaries”, and do not misattribute the
+#                      fork's runner or databases to upstream.
+#
+# ── FlexNetOS additions: this fork owns these, upstream does not ────────────
+#
+# Kept separate on purpose. Attributing a fork behaviour to upstream is a
+# sourcing-law violation and it has already happened: a draft rewrote
+# paths.tmpdir_hardcoded to assert that upstream never falls back to a temp dir,
+# which describes the FORK's fallible resolver, not upstream's infallible one.
+# Upstream's terminal fallbacks stay permitted.
+#
+#   NODE LANE        bun and bun x are the drop-in replacements for npm and npx.
+#                    The flake contract asserts bun is 1.3.14, and asserts npm,
+#                    npx, pnpm, corepack and yarn are ABSENT
+#                    from the profile -- so a remedy naming them is broken before
+#                    it is run (install.global_node_package,
+#                    install.node_lane_absent).
+#   LATEST RELEASES  Track the latest release rather than freezing an old one:
+#                    run a tool through the Bun lane at @latest
+#                    (rtk bun x --bun <tool>@latest), refresh the installation
+#                    through its one declared owner, and move a flake input's pin
+#                    forward instead of installing outside the flake. Upstream
+#                    makes updates explicit and one-owner; "not the newest
+#                    release" has no static regex shape, so the guard names the
+#                    current action and never pretends it is itself an updater.
+#   SHELL ENTRY      Every agent shell command enters through RTK -- see RTK
+#                    FRONTDOOR at the top of this file.
+#   ICM STORAGE      ICM uses BOTH SQLite and PostgreSQL. The published binary
+#                    carries all backends and selects one at RUNTIME through
+#                    ICM_DB_BACKEND; SQLite is the in-process default, and --db /
+#                    ICM_DB set its path, which the remote backends ignore. Do not
+#                    assume a single backend when reading or repairing its corpus,
+#                    and do not "fix" a backend by naming a path in a command
+#                    (see paths.dotlocal_tool_state).
+
+[[patterns]]
+id = "paths.session_env_ownership"
+priority = 200
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '((^|[\s;&|(])(cp|mv|ln|install|tee|touch|rsync)\s[^;&|]*|>>?\s*)[^\s;&|]*environment\.d/|writeTextDir\s+"[^"]*environment\.d/' }
+message = """
+This writes a systemd environment.d drop-in. That directory is read by the
+systemd USER MANAGER -- the parent of gnome-session and every desktop app -- so
+a file there owns the entire graphical session, not a dev shell. A redirected
+data root placed there once handed GNOME a fresh empty login keyring.
+
+Upstream Yazelix has no such layer, and its contracts already say where each
+scope lives:
+  C8     the desktop entry starts yzx by its absolute profile path, so a GUI
+         launch never depends on a session PATH
+  C1     `yzx run <program>` reuses the prepared environment
+  shell  the managed Nu config, which runs per-shell and wins over session scope
+Configure the GUI through the desktop entry and the shell through managed Nu.
+There is no third scope to add, and no exception that reintroduces one.
+
+This is upstream's Method 6 -- "Avoid duplicate owners, adapters, generated
+fixtures, and compatibility shims" -- and its Core Rule: "The user decides scope.
+Do not create a feature, compatibility surface, module, or planning bead until
+the user has chosen that direction." A session-env tier is a duplicate owner of
+what the packaged Nu layer already owns. Do not ask which scope should carry a
+value either; point 12 of the upstream section above already answers it, and
+point 13 records that systemd does not appear upstream at all. A violation is a
+violation, and an exception carved for one variable is how the last one survived
+five sessions.
+
+Reading, listing or grepping environment.d is not matched here -- only writing.
+"""
+
+[[patterns]]
+id = "paths.code_discipline_generated_copy"
+priority = 200
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '\A[^\s;&|]*var/lib/claude/CODE-DISCIPLINE\.md' }
+message = """
+Regenerate this copy from its canonical source instead of editing it:
+
+  rtk cp /home/flexnetos/meta/.claude/CODE-DISCIPLINE.md /home/flexnetos/meta/var/lib/claude/CODE-DISCIPLINE.md
+
+The 10 laws have one owner and one producer, so they read the same in every
+session:
+  CANONICAL  meta's tracked .claude/CODE-DISCIPLINE.md, which meta's CLAUDE.md
+             loads as @.claude/CODE-DISCIPLINE.md
+  DERIVED    this copy in the Claude home, which that home's CLAUDE.md loads as
+             @CODE-DISCIPLINE.md
+
+/var/ is gitignored, so a hand edit here appears in no diff and the two copies
+drift silently -- the same failure the generated user-level policy copy already
+caused once. Editing a generated file in place creates a second owner of it.
+
+This matches a file-writing tool whose TARGET is this copy, because the target
+is the first line of the payload the rule sees. It deliberately does not match
+the path anywhere else: a document that quotes the cp command above, a read, a
+list, a grep, and a shell write are all allowed. Matching write verbs anywhere
+in the payload was tried first and had to be withdrawn -- validators do not run
+on file payloads, so the rule denied every document that quoted its own remedy,
+including this rule's own KB record.
+"""
+
+[[patterns]]
+id = "paths.surface_pinned_in_source"
+priority = 200
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(^|[\s=\[({,;"\x27\x60])/(?:[-A-Za-z0-9._~@+]|["\x27\x60])' }
+message = """
+This pins an absolute path inside a Nushell runtime source file. Upstream's startup
+boundary is "Owned by runtime/yzx/ (Nix substitutes paths; Rust owns wiring and
+exec)" -- the derivation produces every path, and the source carries only a
+placeholder. Path law is absolute: no loophole, no exception, no second owner.
+
+Use the already-established substitution form:
+
+  in the .nu source     let cargo_home = "@cargoHome@"
+  in flake.nix          flexnetosNuConfigFor = pkgs: pkgs.replaceVars ./... {
+                          inherit cargoHome;
+                        }
+
+replaceVars is fail-closed -- an unsubstituted placeholder breaks the build
+instead of shipping a literal. Define the value once and pass it to every
+consumer; a second attribute set repeating it is the duplicate owner Method 6
+forbids.
+
+This file-only rule is target-aware in evaluate_path_law_for_target(): it scans
+every non-comment line of a .nu destination, including quoted, bare, raw,
+interpolated, backtick, list, record, let/const and audit forms. The token
+boundary deliberately excludes `://`, so a URL is not mistaken for a path. It
+scans only added lines in apply_patch payloads, so a removed violation stays
+removable. Markdown evidence and .nix producer values are not Nushell source
+and are not matched here.
 """
 
 [[patterns]]
@@ -441,7 +828,7 @@ Working example -- packaging/icm_release.nix:
 
 If a raw `cargo build` fails on a -sys crate, build it through nix, or use the
 CI devshell that already carries pkg-config:
-  nix develop path:<yazelix>#ci
+  rtk nix develop path:<yazelix>#ci
 """
 
 [[patterns]]
@@ -506,56 +893,6 @@ Read the surface. A .nix file may set these freely -- that is the Yazelix
 source layer producing the value, and this rule does not fire there.
 """
 
-# ── yazelix upstream direction ──────────────────────────────────────────────
-#
-# Verified against upstream/main 78d18c94 (luccahuguet/yazelix). This is what
-# upstream DIRECTS, or what its pattern shows. The fork diverges from every line
-# below, so a remedy that contradicts one of them is wrong before it is run.
-#
-# HARDCODED PATHS    Upstream owns none. A whole-tree search for absolute /home,
-#                    /usr, /opt and /srv literals returns exactly one hit, and it
-#                    is a discovery CANDIDATE list, not an owned path
-#                    (crates/yzx-open/src/main.rs, alongside hx/helix/nvim).
-#                    Paths are resolved through a chain, never asserted.
-#
-# CARGO AND FENIX    Upstream sets NO cargo home and NO cargo target dir
-#                    anywhere. Fenix IS upstream but arrives TRANSITIVELY: it is
-#                    absent from the 14 root inputs and enters through component
-#                    flakes (yazelixHelix, yazelixScreen, yazelixZellijBar,
-#                    yazelixZellijPaneOrchestrator). Read flake.lock nodes, not
-#                    flake.nix declarations, before claiming what is upstream.
-#
-# AGENT CONFIG       Semantic keys in config.toml, never a config tree:
-#                    agent.command (executable string or "auto"; default "auto"),
-#                    agent.args, keybindings.agent. runtime/yzx-agent.rs
-#                    bootstraps providers BY NAME. Agents are COMMANDS.
-#
-# AGENT HOMES        Upstream ships ZERO agent config directories and no agents/
-#                    path of any kind. An agent home is that agent's own surface,
-#                    owned by the agent, never carried inside yazelix.
-#
-# ACTIVE CONFIG      crates/yzx-config/src/paths.rs config_paths() builds every
-#                    active path from home.join(..) under the config root:
-#                    config.toml, cursors.toml, mars/config.toml,
-#                    zellij/config.kdl, helix/*, nu/env.nu. The same module
-#                    carries is_home_manager_owned() and reject_mutation(), which
-#                    REFUSE to mutate a generated file and name the owning option
-#                    instead of writing it.
-#
-# NUSHELL ENV        Packaged first, user after. Upstream ships exactly two Nu
-#                    files and sets no paths and creates no directories in
-#                    either. The generated runtime env.nu does a source-env of
-#                    the USER's nu/env.nu, whose starter text is literally
-#                    "Loaded after Yazelix Nova packaged env.nu"
-#                    (crates/yzx-config/src/catalog.rs, NU_ENV_STARTER).
-#
-# ADDING A TOOL      home.packages in the flake and in the home-manager module
-#                    (home-manager/module.nix: home.packages = [cfg.package]).
-#
-# DATABASE           Upstream ships none -- no postgres, sqlite or redb appears
-#                    in any upstream .nix. Binaries arrive from the store through
-#                    packages, never from a host install.
-
 [[patterns]]
 id = "paths.yazelix_packaged_config_layer"
 priority = 161
@@ -615,7 +952,7 @@ edit and does not trip this rule; adding or keeping one does.
 #
 # The sanctioned cutover is deliberately NOT matched. Installing a project flake
 # OUTPUT is how the profile is built:
-#   nix profile add --refresh --profile <profile> github:<org>/<repo>#<output>
+#   rtk nix profile add --refresh --profile <profile> github:<org>/<repo>#<output>
 # What is denied is pulling an INDIVIDUAL package out of the general registry
 # into the profile, which is the drift this section exists to stop.
 
@@ -676,13 +1013,42 @@ violation as `install -g`.
 Use the profile-owned Bun lane, never Node/npm/npx or a user-bin shadow. The
 flake contract asserts npm, npx, pnpm, corepack and yarn are ABSENT from this
 profile, so any remedy naming them is broken before it is even run. Bun is
-pinned at 1.3.14 with bunx alongside it, and node comes from nodejs_24.
+pinned at 1.3.14, and node comes from nodejs_24.
 
-  run a tool once      rtk bunx --bun <tool>@latest <args>
+  run a tool once      rtk bun x --bun <tool>@latest <args>
   add a project dep    rtk bun add <pkg>
   install project deps rtk bun install
 
 To make a tool permanent, declare it as a flake input and let the profile own it.
+"""
+
+# Anchored at the START of the segment, because evaluate_command() has already
+# split on && || ; and pipes. The prefix group absorbs leading VAR=value
+# assignments and the sudo/rtk/proxy wrappers, so `rtk npm run build` and
+# `rtk proxy -- npx foo` are caught while `rtk grep -E 'npm|npx' file` is not --
+# there the token after `rtk` is grep, not a package manager. Matching the bare
+# name anywhere in a segment was tried first and denied ordinary searches.
+[[patterns]]
+id = "install.node_lane_absent"
+priority = 150
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '^(?:\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|rtk|proxy|--)\s+)*(?:npm|npx|pnpm|yarn|corepack)\b' }
+message = """
+This profile has no npm, npx, pnpm, yarn or corepack. The flake contract asserts
+all five are ABSENT, so the command cannot run -- it is not a style preference.
+
+bun and bun x are their drop-in replacements, pinned at 1.3.14:
+
+  npx <tool> <args>      -> rtk bun x --bun <tool>@latest <args>
+  npm install            -> rtk bun install
+  npm install <pkg>      -> rtk bun add <pkg>
+  npm run <script>       -> rtk bun run <script>
+  pnpm / yarn <anything> -> the matching rtk bun form above
+
+Run tools at @latest rather than freezing an old version. To make a tool
+permanent, declare it as a flake input and let the profile own it; a global
+install is denied separately by install.global_node_package.
 """
 
 [[patterns]]
@@ -737,3 +1103,4 @@ To make it permanent, declare it as a flake input and let the profile own it.
 # "tools that need the prefix" was the wrong shape -- it silently permits every
 # command nobody remembered to list, which is the same hole the rule exists to
 # close.
+

@@ -974,10 +974,16 @@ pub fn evaluate_path_law_for_target(text: &str, target: Option<&str>) -> Option<
             .trim_end_matches(['"', '\'', ',', ';'])
             .ends_with(".nix")
     });
+    let authored_in_nushell = target.is_some_and(|path| {
+        path.trim()
+            .trim_end_matches(['"', '\'', ',', ';'])
+            .ends_with(".nu")
+    });
 
     patterns
         .iter()
         .filter(|p| p.id.starts_with("paths."))
+        .filter(|p| p.id != "paths.surface_pinned_in_source" || authored_in_nushell)
         .filter(|p| !(authored_in_nix && NIX_AUTHORED_SURFACE_RULES.contains(&p.id.as_str())))
         .find(|p| p.regex.is_match(text))
         .map(|p| DenyReason {
@@ -1007,6 +1013,13 @@ pub fn evaluate_command(command: &str) -> Option<DenyReason> {
 /// Evaluate a single command segment using compiled regex patterns.
 fn evaluate_segment(segment: &str, patterns: &[CompiledPattern]) -> Option<DenyReason> {
     for pattern in patterns {
+        // Path-law rules are for file payloads. Applying them to shell
+        // commands makes a command that merely contains an absolute argument
+        // look like a Nushell source edit and bypasses the target-aware
+        // filtering in evaluate_path_law_for_target().
+        if pattern.id.starts_with("paths.") {
+            continue;
+        }
         if pattern.regex.is_match(segment) {
             // Additional validation if required
             if let Some(ref validator) = pattern.validator {
@@ -1526,7 +1539,7 @@ message = "??"
     #[test]
     fn force_push_reason_suggests_lease() {
         let denial = evaluate_command("git push --force").unwrap();
-        assert!(denial.reason.contains("--force-with-lease"));
+        assert!(denial.reason.contains("Reconcile"));
     }
 
     #[test]
@@ -2535,11 +2548,11 @@ message = "medium priority"
         // Installing the project's own flake OUTPUT is the documented cutover,
         // and read-only profile inspection must stay available.
         for cmd in [
-            "nix profile add --refresh --profile /p github:FlexNetOS/yazelix#lifeos_foundation_yzx",
+            "rtk nix profile add --refresh --profile /p github:FlexNetOS/yazelix#lifeos_foundation_yzx",
             "nix profile list --profile /p --json",
             "nix run nixpkgs#ripgrep -- --version",
-            "npm install",
-            "npm install lodash",
+            "rtk bun install",
+            "rtk bun add lodash",
             "cargo build --release",
             "cargo run --bin agent",
             "go build ./...",
