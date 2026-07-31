@@ -3013,6 +3013,9 @@ message = "medium priority"
             r#"mut state = "/run/user/4242/state""#,
             r#"let retired = ["/nix/store/retired"]"#,
             r#"$env.CARGO_HOME = "/home/alice/cargo""#,
+            r#"let policy = "/etc/systemd/user""#,
+            r#"let candidate = "/usr/bin/nvim""#,
+            r#"let scratch = "/tmp/runtime""#,
         ] {
             assert!(
                 evaluate_path_law_for_target(source, Some("/w/runtime.nu")).is_some(),
