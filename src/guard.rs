@@ -18,7 +18,9 @@ use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(test))]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 // ── Configuration ───────────────────────────────────────
@@ -347,7 +349,7 @@ impl GuardConfig {
     pub fn load() -> Self {
         #[cfg(test)]
         {
-            return Self::load_from_embedded();
+            Self::load_from_embedded()
         }
 
         #[cfg(not(test))]
@@ -368,6 +370,7 @@ impl GuardConfig {
     }
 
     /// Load config from project-level `.claude/agent-guard.toml`.
+    #[cfg(not(test))]
     fn load_from_project() -> Option<Self> {
         let path = Path::new(".claude/agent-guard.toml");
         Self::load_from_file(path)
@@ -378,6 +381,7 @@ impl GuardConfig {
     /// `CLAUDE_CONFIG_DIR` wins when set because it is Claude's documented
     /// configuration-home surface. When it is unset, Claude's supported
     /// `~/.claude` fallback remains available.
+    #[cfg(not(test))]
     fn load_from_user() -> Option<Self> {
         let dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
             Some(v) if !v.is_empty() => PathBuf::from(v),
@@ -392,6 +396,7 @@ impl GuardConfig {
     }
 
     /// Load config from a specific file path.
+    #[cfg(not(test))]
     fn load_from_file(path: &Path) -> Option<Self> {
         let contents = std::fs::read_to_string(path).ok()?;
         toml::from_str(&contents).ok()
@@ -2169,12 +2174,14 @@ message = "Custom reset message"
         }
 
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct LegacyPattern {
             #[serde(default)]
             validator: Option<LegacyValidator>,
         }
 
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         #[serde(tag = "type")]
         enum LegacyValidator {
             #[serde(rename = "not_contains")]
