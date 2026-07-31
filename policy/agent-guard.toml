@@ -465,15 +465,12 @@ documented committer.
 #                   force-push or delete `stable`" -- and rolled back with a new
 #                   revert commit on main, never a rewrite
 #
-#  1 HARD-CODED PATHS  Upstream owns none. Searching upstream SOURCE -- the .rs,
-#                      .nix, .nu, .sh, .toml and .kdl files -- for quoted /home,
-#                      /usr, /opt and /srv literals returns exactly one hit, and
-#                      it is a discovery CANDIDATE list, not an owned path:
-#                      crates/yzx-open/src/main.rs:1202, alongside hx/helix/nvim.
-#                      Scope the search that way. Grepping the whole tree instead
-#                      returns prose hits from the bead ledger and the changelog,
-#                      which say nothing about what the runtime owns.
-#                      The startup boundary is "Owned by runtime/yzx/
+#  1 HARD-CODED PATHS  Upstream has no host-placement literal acting as a
+#                      runtime/config owner. A controlled whole-tree search does
+#                      find absolute literals in CI cleanup, maintainer and docs
+#                      examples, architecture prose, and executable candidate
+#                      tests. Those are evidence or candidates, not placement
+#                      authority. The startup boundary is "Owned by runtime/yzx/
 #                      (Nix substitutes paths; Rust owns wiring and exec)":
 #                      literals are produced by the derivation, and every surface
 #                      is a precedence chain, never an assignment
@@ -564,27 +561,31 @@ documented committer.
 #                      mise activate nu -> optional user Nu". The packaged layer
 #                      is the shell-scope owner. There is no session-scope tier.
 #
-# 10 yzx enter AND     Both are the same entry point, exec_managed() in
+# 10 yzx enter AND     Both use exec_managed() in
 #    yzx launch        runtime/yzx/cli.rs: prepare the runtime with Yazi, build
 #                      the managed Zellij command with the packaged config and
 #                      layout, apply() the whole prepared environment, exec.
 #                      `enter` starts Yazelix in the current terminal; `launch`
 #                      opens Mars and starts the same workspace inside it.
-#                      THIS IS WHY PATH LAW IS ABSOLUTE: one prepared environment
-#                      is stamped onto everything the session launches -- every
-#                      pane, every tool, the runner, the databases -- so a path
-#                      that is wrong at prepare time is wrong everywhere for the
-#                      life of the session, and no later command can correct it.
-#                      C1's "run reuses the prepared environment" is the same
-#                      mechanism for `yzx run <program>`.
+#                      Upstream stops at that handoff and contains no FlexNetOS
+#                      runner or database integration. The owner's FlexNetOS law
+#                      is stronger: yzx enter and yzx launch launch everything in
+#                      Yazelix, including the runner and databases. That remains
+#                      a fork-owned runtime contract and MUST be proved by a
+#                      behavioral test before anyone says it is implemented.
+#                      Path law is absolute because one prepared environment is
+#                      inherited by every descendant for the life of the
+#                      session; C1 proves the same mechanism for
+#                      `yzx run <program>`.
 #
-# 11 TERMINAL          The most capable terminal emulator wins, and upstream
-#    EMULATOR          proves it by TEST rather than asserting it. Mars is the
-#                      packaged GUI terminal used by yzx launch, "with Kitty
-#                      graphics, cursor shaders, and Yazelix session integration";
-#                      README says yzx enter "will open Yazelix in any capable
-#                      terminal emulator (Mars provides tighter Yazelix
-#                      integration, though)". Capability is never guessed:
+# 11 TERMINAL          OWNER LAW: the terminal emulator with the most advanced
+#    EMULATOR          capabilities always wins, proven by test not by guessing.
+#                      Upstream does not implement a generic ranking. It makes
+#                      Mars the first-class packaged GUI used by yzx launch and
+#                      routes host terminals through yzx enter; this fork's
+#                      terminal-support metadata packages and tests Mars as the
+#                      sole launch terminal. Capability is proved at the
+#                      selection boundary:
 #                        - managed_program() REFUSES yzx launch when the package
 #                          omits Mars ("use yzx enter or select a package that
 #                          includes Mars") rather than degrading to a lesser one
@@ -629,21 +630,20 @@ documented committer.
 # which describes the FORK's fallible resolver, not upstream's infallible one.
 # Upstream's terminal fallbacks stay permitted.
 #
-#   NODE LANE        bun and bunx are the drop-in replacements for npm and npx.
-#                    The flake contract asserts bun is 1.3.14 with bunx alongside
-#                    it, and asserts npm, npx, pnpm, corepack and yarn are ABSENT
+#   NODE LANE        bun and bun x are the drop-in replacements for npm and npx.
+#                    The flake contract asserts bun is 1.3.14, and asserts npm,
+#                    npx, pnpm, corepack and yarn are ABSENT
 #                    from the profile -- so a remedy naming them is broken before
 #                    it is run (install.global_node_package,
 #                    install.node_lane_absent).
 #   LATEST RELEASES  Track the latest release rather than freezing an old one:
 #                    run a tool through the Bun lane at @latest
-#                    (rtk bunx --bun <tool>@latest), refresh a profile cutover
-#                    with nix profile add --refresh, and move a flake input's pin
-#                    forward instead of installing outside the flake. There is
-#                    deliberately NO rule for this: "not the newest release" has
-#                    no shape a regex can see, and inventing one would deny
-#                    correct commands. It is recorded here so every remedy in
-#                    this file stays consistent with it.
+#                    (rtk bun x --bun <tool>@latest), refresh the installation
+#                    through its one declared owner, and move a flake input's pin
+#                    forward instead of installing outside the flake. Upstream
+#                    makes updates explicit and one-owner; "not the newest
+#                    release" has no static regex shape, so the guard names the
+#                    current action and never pretends it is itself an updater.
 #   SHELL ENTRY      Every agent shell command enters through RTK -- see RTK
 #                    FRONTDOOR at the top of this file.
 #   ICM STORAGE      ICM uses BOTH SQLite and PostgreSQL. The published binary
@@ -693,18 +693,18 @@ id = "paths.surface_pinned_in_source"
 priority = 200
 enabled = true
 decision = "deny"
-matcher = { type = "regex", pattern = '''(?m)\$env\.[A-Za-z_][A-Za-z0-9_]*\s*=\s*"(/home/|/run/user/|/nix/store/)|(^|[\s;&|('"])let\s+[a-z_][a-z0-9_]*\s*=\s*"(/home/|/run/user/)''' }
+matcher = { type = "regex", pattern = '["\x27](?:/home/|/run/user/|/nix/store/)' }
 message = """
-This pins an absolute path inside a runtime source file. Upstream's startup
+This pins an absolute path inside a Nushell runtime source file. Upstream's startup
 boundary is "Owned by runtime/yzx/ (Nix substitutes paths; Rust owns wiring and
 exec)" -- the derivation produces every path, and the source carries only a
 placeholder. Path law is absolute: no loophole, no exception, no second owner.
 
-Do it the way this repo already does it, do not ask which way is preferred:
+Use the already-established substitution form:
 
   in the .nu source     let cargo_home = "@cargoHome@"
   in flake.nix          flexnetosNuConfigFor = pkgs: pkgs.replaceVars ./... {
-                          cargoHome = "/home/<user>/...";
+                          inherit cargoHome;
                         }
 
 replaceVars is fail-closed -- an unsubstituted placeholder breaks the build
@@ -712,9 +712,11 @@ instead of shipping a literal. Define the value once and pass it to every
 consumer; a second attribute set repeating it is the duplicate owner Method 6
 forbids.
 
-A .nix file is the entitled owner and is not matched here. Neither is a `const`
-declaring a path the script AUDITS rather than publishes, nor a value already
-read from a surface (`$env.XDG_RUNTIME_DIR?`).
+This file-only rule is target-aware in evaluate_path_law_for_target(): it scans
+every non-comment line of a .nu destination, including let/const/list/audit
+forms, and scans only added lines in apply_patch payloads. A removed violation
+therefore stays removable. Markdown evidence and .nix producer values are not
+Nushell source and are not matched here.
 """
 
 [[patterns]]
@@ -954,9 +956,9 @@ violation as `install -g`.
 Use the profile-owned Bun lane, never Node/npm/npx or a user-bin shadow. The
 flake contract asserts npm, npx, pnpm, corepack and yarn are ABSENT from this
 profile, so any remedy naming them is broken before it is even run. Bun is
-pinned at 1.3.14 with bunx alongside it, and node comes from nodejs_24.
+pinned at 1.3.14, and node comes from nodejs_24.
 
-  run a tool once      rtk bunx --bun <tool>@latest <args>
+  run a tool once      rtk bun x --bun <tool>@latest <args>
   add a project dep    rtk bun add <pkg>
   install project deps rtk bun install
 
@@ -979,9 +981,9 @@ message = """
 This profile has no npm, npx, pnpm, yarn or corepack. The flake contract asserts
 all five are ABSENT, so the command cannot run -- it is not a style preference.
 
-bun and bunx are their drop-in replacements, pinned at 1.3.14:
+bun and bun x are their drop-in replacements, pinned at 1.3.14:
 
-  npx <tool> <args>      -> rtk bunx --bun <tool>@latest <args>
+  npx <tool> <args>      -> rtk bun x --bun <tool>@latest <args>
   npm install            -> rtk bun install
   npm install <pkg>      -> rtk bun add <pkg>
   npm run <script>       -> rtk bun run <script>

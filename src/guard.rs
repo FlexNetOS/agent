@@ -2803,7 +2803,7 @@ message = "medium priority"
             "nix run nixpkgs#ripgrep -- --version",
             "rtk bun install",
             "rtk bun add lodash",
-            "rtk bunx --bun gitnexus@latest analyze",
+            "rtk bun x --bun gitnexus@latest analyze",
             "cargo build --release",
             "cargo run --bin agent",
             "go build ./...",
@@ -2840,7 +2840,7 @@ message = "medium priority"
             "rtk grep -c npm README.md",
             "rtk grep -rn 'pnpm-lock' .",
             "rtk bun install",
-            "rtk bunx --bun gitnexus@latest analyze",
+            "rtk bun x --bun gitnexus@latest analyze",
         ] {
             assert!(evaluate_command(cmd).is_none(), "must stay allowed: {cmd}");
         }
@@ -3003,5 +3003,124 @@ message = "medium priority"
         // ...while the same shapes under a workspace are ordinary paths.
         assert!(evaluate_path_law("/home/alice/work/src/main.rs").is_none());
         assert!(evaluate_path_law("/srv/build/target").is_none());
+    }
+
+    #[test]
+    fn nushell_path_law_has_no_binding_or_audit_loophole() {
+        for source in [
+            r#"let root = "/home/alice/runtime""#,
+            r#"const PROFILE_ROOT = '/home/alice/profile'"#,
+            r#"mut state = "/run/user/4242/state""#,
+            r#"let retired = ["/nix/store/retired"]"#,
+            r#"$env.CARGO_HOME = "/home/alice/cargo""#,
+        ] {
+            assert!(
+                evaluate_path_law_for_target(source, Some("/w/runtime.nu")).is_some(),
+                "Nushell literal escaped: {source}"
+            );
+        }
+
+        for (source, target) in [
+            (r#"let root = "@profileRoot@""#, "/w/runtime.nu"),
+            (
+                r#"# audit example: const ROOT = "/home/alice/example""#,
+                "/w/runtime.nu",
+            ),
+            (r#"const ROOT = "/home/alice/example""#, "/w/evidence.md"),
+            (r#"const ROOT = "/home/alice/example""#, "/w/flake.nix"),
+        ] {
+            assert!(
+                evaluate_path_law_for_target(source, Some(target)).is_none(),
+                "non-runtime evidence was denied: {target}: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_only_rules_do_not_deny_read_only_commands() {
+        for command in [
+            r#"rtk rg -n '"/home/' nushell"#,
+            "rtk rg -n 'nushell/config.nu' flake.nix",
+        ] {
+            assert!(
+                evaluate_command(command).is_none(),
+                "file-only rule denied a command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_patch_scans_each_target_and_only_new_content() {
+        let introducing = r#"*** Begin Patch
+*** Update File: runtime/host_policy.nu
+@@
+-const PROFILE_ROOT = "@profileRoot@"
++const PROFILE_ROOT = "/home/alice/.nix-profile"
+*** End Patch
+"#;
+        let updates = parse_apply_patch(introducing);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].target, "runtime/host_policy.nu");
+        assert_eq!(
+            updates[0].added,
+            r#"const PROFILE_ROOT = "/home/alice/.nix-profile""#
+        );
+        let payload = format!("{}\n{}", updates[0].target, updates[0].added);
+        assert!(
+            evaluate_path_law_for_target(&payload, Some(&updates[0].target)).is_some(),
+            "apply_patch addition escaped the path law"
+        );
+
+        let removing = r#"*** Begin Patch
+*** Update File: runtime/host_policy.nu
+@@
+-const PROFILE_ROOT = "/home/alice/.nix-profile"
++const PROFILE_ROOT = "@profileRoot@"
+*** End Patch
+"#;
+        let update = parse_apply_patch(removing).pop().expect("one update");
+        let payload = format!("{}\n{}", update.target, update.added);
+        assert!(
+            evaluate_path_law_for_target(&payload, Some(&update.target)).is_none(),
+            "old removed content must not prevent its repair"
+        );
+
+        let deleting = parse_apply_patch(
+            "*** Begin Patch\n*** Delete File: nushell/retired.nu\n*** End Patch\n",
+        );
+        assert_eq!(deleting.len(), 1);
+        assert!(!deleting[0].writes_content());
+    }
+
+    #[test]
+    fn patch_moves_and_multiedit_cannot_smuggle_a_second_target() {
+        let moved = parse_apply_patch(
+            "*** Begin Patch\n*** Update File: safe.nu\n*** Move to: nushell/runtime.nu\n*** End Patch\n",
+        );
+        assert_eq!(
+            moved[0].paths,
+            vec!["safe.nu".to_string(), "nushell/runtime.nu".to_string()]
+        );
+        assert!(moved[0].writes_content());
+
+        let input: ToolInput = serde_json::from_str(
+            r#"{
+                "file_path": "/w/safe.nu",
+                "new_string": "let ok = \"@root@\"",
+                "edits": [{
+                    "file_path": "/w/second.nu",
+                    "new_string": "const ROOT = \"/home/alice/hidden\""
+                }]
+            }"#,
+        )
+        .expect("valid MultiEdit payload");
+        let writes = input.file_writes();
+        assert_eq!(writes.len(), 2);
+        assert!(
+            writes.iter().any(|write| {
+                evaluate_path_law_for_target(&write.payload, Some(write.target)).is_some()
+            }),
+            "nested edit escaped the path law"
+        );
     }
 }
