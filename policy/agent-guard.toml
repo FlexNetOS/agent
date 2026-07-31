@@ -457,15 +457,23 @@ documented committer.
 #                   user has chosen that direction"
 #   Method 3 and 6  "Choose one owner in this repo" / "Avoid duplicate owners,
 #                   adapters, generated fixtures, and compatibility shims"
-#   Git workflow    "Work directly on main by default. Do not create a separate
-#                   branch unless the user explicitly requests one"; stable is
-#                   promotion-only, advanced by pushing a checked revision
+#   Git workflow    "Work directly on `main` by default. Do not create a
+#                   separate branch unless the user explicitly requests one or
+#                   another repository instruction requires it." `stable` is "a
+#                   promotion-only user channel", advanced only by pushing an
+#                   exact verified SHA -- "git push origin <sha>:stable; never
+#                   force-push or delete `stable`" -- and rolled back with a new
+#                   revert commit on main, never a rewrite
 #
-#  1 HARD-CODED PATHS  Upstream owns none. A whole-tree search for absolute
-#                      /home, /usr, /opt and /srv literals returns exactly one
-#                      hit, and it is a discovery CANDIDATE list, not an owned
-#                      path (crates/yzx-open/src/main.rs, alongside hx/helix/
-#                      nvim). The startup boundary is "Owned by runtime/yzx/
+#  1 HARD-CODED PATHS  Upstream owns none. Searching upstream SOURCE -- the .rs,
+#                      .nix, .nu, .sh, .toml and .kdl files -- for quoted /home,
+#                      /usr, /opt and /srv literals returns exactly one hit, and
+#                      it is a discovery CANDIDATE list, not an owned path:
+#                      crates/yzx-open/src/main.rs:1202, alongside hx/helix/nvim.
+#                      Scope the search that way. Grepping the whole tree instead
+#                      returns prose hits from the bead ledger and the changelog,
+#                      which say nothing about what the runtime owns.
+#                      The startup boundary is "Owned by runtime/yzx/
 #                      (Nix substitutes paths; Rust owns wiring and exec)":
 #                      literals are produced by the derivation, and every surface
 #                      is a precedence chain, never an assignment
@@ -479,11 +487,17 @@ documented committer.
 #
 #  2 CARGO AND FENIX   Upstream sets NO cargo home and NO cargo target dir
 #                      anywhere, and ships no rust-toolchain file. Fenix IS
-#                      upstream but arrives TRANSITIVELY: it is absent from the
-#                      14 root inputs and enters through component flakes
-#                      (yazelixHelix, yazelixScreen, yazelixZellijBar,
-#                      yazelixZellijPaneOrchestrator). Read flake.lock nodes, not
-#                      flake.nix declarations, before claiming what is upstream.
+#                      upstream but arrives TRANSITIVELY: it is absent from all
+#                      14 root inputs and enters through four component flakes --
+#                      yazelixScreen, yazelixZellijBar,
+#                      yazelixZellijPaneOrchestrator, yazelixZellijPopup. Read
+#                      flake.lock NODES, not flake.nix declarations, before
+#                      claiming what is upstream, and derive the list rather than
+#                      recalling it -- an earlier revision of this line named
+#                      yazelixHelix, which takes no fenix input at all:
+#                        jq -r '[.nodes | to_entries[]
+#                                | select(.value.inputs.fenix != null)
+#                                | .key] | sort | .[]' flake.lock
 #                      This fork's flake.nix composes fenix and owns it
 #                      (see paths.rustup_not_used).
 #
@@ -679,7 +693,7 @@ id = "paths.surface_pinned_in_source"
 priority = 200
 enabled = true
 decision = "deny"
-matcher = { type = "regex", pattern = '(?m)\$env\.[A-Za-z_][A-Za-z0-9_]*\s*=\s*"(/home/|/run/user/|/nix/store/)|^\s*let\s+[a-z_][a-z0-9_]*\s*=\s*"(/home/|/run/user/)' }
+matcher = { type = "regex", pattern = '''(?m)\$env\.[A-Za-z_][A-Za-z0-9_]*\s*=\s*"(/home/|/run/user/|/nix/store/)|(^|[\s;&|('"])let\s+[a-z_][a-z0-9_]*\s*=\s*"(/home/|/run/user/)''' }
 message = """
 This pins an absolute path inside a runtime source file. Upstream's startup
 boundary is "Owned by runtime/yzx/ (Nix substitutes paths; Rust owns wiring and
