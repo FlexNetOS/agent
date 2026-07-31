@@ -952,6 +952,58 @@ edit and does not trip this rule; adding or keeping one does.
 # into the profile, which is the drift this section exists to stop.
 
 [[patterns]]
+id = "source.ruvnet_published_artifact_authority"
+priority = 160
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(?i)(?:git\s+(?:clone|fetch|pull)|(?:curl|wget)\s+[^\n]*)(?:[^\n]*github\.com[^\n]*(?:ruvector|agentdb|ruflo)|[^\n]*(?:ruvector|agentdb|ruflo)[^\n]*github\.com)' }
+message = """
+This obtains a published rUv Node/NAPI artifact from GitHub. GitHub is not the
+release authority for these runtime artifacts.
+
+Source authority is split by artifact:
+
+  Node/NAPI and CLI packages
+    npmjs, queried through the Yazelix Bun lane:
+      rtk bun pm view <package> version --registry=https://registry.npmjs.org
+      rtk bun add <package>@<version>
+    Current examples include ruvector, @ruvector/*, agentdb, and ruflo.
+
+  PostgreSQL/native source
+    the canonical local Meta peer at
+    /home/flexnetos/meta/src/meta-ruvector, built by the Yazelix PostgreSQL
+    packaging derivation. Do not substitute the npm package for ruvector.so.
+
+  Rust-only crates
+    crates.io is a fallback only when the required artifact is not published
+    through npmjs. It is not a substitute for a newer published Node/NAPI
+    package.
+
+Permanent installation still belongs in the Yazelix owner graph: pin the
+registry version in the packaging derivation and lockfile, expose its binary
+through flexnetosExecutables, and include that derivation in
+lifeos_foundation_yzx. Never clone a GitHub release into /srv or a user path.
+"""
+
+[[patterns]]
+id = "install.ruvector_cli_native_installer"
+priority = 165
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(^|\s)(?:ruvector-pg|rvpg)\s+install\b' }
+message = """
+This invokes the npm package's out-of-band native installer. The published
+@ruvector/postgres-cli package is the npmjs authority for the CLI, but its
+`install` implementation clones GitHub source, invokes rustup/cargo-pgrx, and
+can create host PostgreSQL/systemd state. Those are competing owners under the
+Yazelix path law.
+
+Use the profile-owned npm package for CLI operations and status only. The
+PostgreSQL/RuVector extension and database are started by Yazelix's own
+profile/runtime packaging, with all paths and binaries in the Yazelix closure.
+"""
+
+[[patterns]]
 id = "install.registry_package_into_profile"
 priority = 155
 enabled = true

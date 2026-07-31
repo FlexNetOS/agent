@@ -2780,6 +2780,38 @@ message = "medium priority"
     }
 
     #[test]
+    fn ruvnet_node_artifacts_use_npmjs_and_meta_ruvector_stays_native() {
+        for cmd in [
+            "git clone https://github.com/ruvnet/RuVector.git",
+            "git fetch https://github.com/ruvnet/agentdb.git main",
+            "curl -fsSL https://github.com/ruvnet/ruflo/archive/refs/tags/v3.34.0.tar.gz",
+        ] {
+            let denial = evaluate_command(cmd)
+                .unwrap_or_else(|| panic!("GitHub rUv source must be denied: {cmd}"));
+            assert_eq!(denial.decision, Decision::Deny, "{cmd}");
+        }
+
+        for cmd in [
+            "rtk bun pm view ruvector version --registry=https://registry.npmjs.org",
+            "rtk bun add ruvector@0.2.40",
+            "rtk git -C /home/flexnetos/meta/src/meta-ruvector status --short",
+            "rtk cargo build -p ruvector-postgres",
+            "rtk ruvector-pg status",
+        ] {
+            assert!(
+                evaluate_command(cmd).is_none(),
+                "registry/native owner command must remain allowed: {cmd}"
+            );
+        }
+
+        for cmd in ["rtk ruvector-pg install", "rtk rvpg install --native"] {
+            let denial = evaluate_command(cmd)
+                .unwrap_or_else(|| panic!("out-of-band ruvector installer must be denied: {cmd}"));
+            assert_eq!(denial.decision, Decision::Deny, "{cmd}");
+        }
+    }
+
+    #[test]
     fn install_law_closes_the_flag_order_and_binstall_bypasses() {
         // Gap hunt on the first cut of these rules: each of these walked
         // straight through it.
