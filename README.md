@@ -20,18 +20,20 @@ cargo build --release
 
 ### `agent guard`
 
-Evaluate a command for destructive patterns. Designed to run as a Claude Code PreToolUse hook.
+Evaluate shell commands, file targets, and newly written source for policy
+violations. Designed for Claude and Codex `PreToolUse` hooks; unknown tools are
+silent no-ops.
 
 ```bash
 # Test directly
-echo '{"tool_input":{"command":"git push --force"}}' | agent guard
+printf '%s\n' '{"tool_name":"Bash","tool_input":{"command":"git push --force"}}' | rtk agent guard
 # Output: JSON with permissionDecision: "deny" and reason
 
-echo '{"tool_input":{"command":"git status"}}' | agent guard
+printf '%s\n' '{"tool_name":"Bash","tool_input":{"command":"rtk git status"}}' | rtk agent guard
 # Output: (silent = allowed)
 ```
 
-**Claude Code hook configuration** (`.claude/settings.json`):
+Claude fires a hook without a matcher for every occurrence of that event:
 
 ```json
 {
@@ -40,29 +42,33 @@ echo '{"tool_input":{"command":"git status"}}' | agent guard
       {
         "hooks": [
           {
-            "command": "agent guard",
+            "command": "rtk agent guard",
             "timeout": 5,
             "type": "command"
           }
-        ],
-        "matcher": "Bash"
+        ]
       }
     ]
   }
 }
 ```
 
+Codex should use a `"*"` PreToolUse matcher for this guard. Both routes deliver
+all supported local tool events; the guard itself recognizes shell calls plus
+direct and namespaced filesystem operations and silently ignores unrelated
+tools. Codex supplies its `apply_patch` payload in `tool_input.command`.
+
 **Blocked patterns** (configurable via `.claude/agent-guard.toml`):
 
 | Pattern | What it blocks | Safe alternative |
 |---------|----------------|------------------|
-| `git push --force` | Force push | `--force-with-lease` |
-| `git reset --hard` | Hard reset | `git stash` or snapshot |
-| `git clean -fd` | Clean force | `git clean -nd` (dry run) |
-| `git checkout .` | Checkout all | Specific files |
-| `git branch -D` | Force delete branch | `git branch -d` |
-| `git stash drop/clear` | Drop stashes | `git stash list` first |
-| `rm -rf .` / `*` / `.meta` | Dangerous rm | Specific paths |
+| `git push --force` | Force push | `rtk git pull --rebase`, then `rtk git push` |
+| `git reset --hard` | Hard reset | `rtk git stash push --include-untracked` |
+| `git clean -fd` | Clean force | `rtk git clean -nd` (dry run) |
+| `git checkout .` | Checkout all | `rtk git diff -- <path>` before a targeted edit |
+| `git branch -D` | Force delete branch | `rtk git branch -d <branch>` |
+| `git stash drop/clear` | Drop stashes | `rtk git stash list` first |
+| `rm -rf .` / `*` / `.meta` | Dangerous rm | `rtk rm -rf <specific-path>` |
 
 ### `agent score`
 

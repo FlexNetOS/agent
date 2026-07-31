@@ -13,15 +13,17 @@ setup() {
     # the build succeeded and every test still failed with
     #   /bin/sh: 1: ./target/debug/agent: not found
     local target_dir
-    target_dir="$(cargo metadata --no-deps --format-version 1 --manifest-path "$manifest" 2>/dev/null \
-        | jq -r '.target_directory // empty' 2>/dev/null)"
+    target_dir="$(rtk cargo metadata --no-deps --format-version 1 --manifest-path "$manifest" 2>/dev/null \
+        | rtk jq -r '.target_directory // empty' 2>/dev/null)"
     [ -n "$target_dir" ] || target_dir="${CARGO_TARGET_DIR:-$BATS_TEST_DIRNAME/../target}"
 
     AGENT_BIN="$target_dir/debug/agent"
 
-    if [ ! -x "$AGENT_BIN" ]; then
-        cargo build --manifest-path "$manifest" --quiet
-    fi
+    # Always ask Cargo to validate freshness. Checking only `-x` reused a
+    # pre-change binary after src/guard.rs changed, so the integration suite
+    # reported the behavior of yesterday's guard while the Rust tests exercised
+    # today's source. Cargo's incremental graph makes the no-change case cheap.
+    rtk cargo build --manifest-path "$manifest" --quiet
 
     # Fail loudly with the resolved path rather than letting each test report a
     # bare "not found" from the shell.
@@ -112,6 +114,49 @@ setup() {
 
 @test "guard allows safe compound command" {
     run bash -c 'echo '"'"'{"tool_input":{"command":"rtk git add . && rtk git commit -m msg && rtk git push"}}'"'"' | '"$AGENT_BIN"' guard'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "guard applies path law to Codex apply_patch additions" {
+    local payload
+    payload='{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Update File: runtime/profile.nu\n@@\n-let root = \"@profileRoot@\"\n+const PROFILE_ROOT = \"/home/alice/.nix-profile\"\n*** End Patch\n"}}'
+    run bash -c 'printf "%s\n" "$1" | "$2" guard' _ "$payload" "$AGENT_BIN"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"permissionDecision":"deny"'* ]]
+    [[ "$output" == *"Nushell runtime source"* ]]
+}
+
+@test "guard applies path law to bare Nushell paths written by any file tool" {
+    local payload
+    payload='{"tool_name":"Write","tool_input":{"file_path":"runtime/profile.nu","content":"let config = { path: /tmp/runtime }"}}'
+    run bash -c 'printf "%s\n" "$1" | "$2" guard' _ "$payload" "$AGENT_BIN"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"permissionDecision":"deny"'* ]]
+    [[ "$output" == *"Nushell runtime source"* ]]
+}
+
+@test "guard applies path law to namespaced MCP file writers" {
+    local payload
+    payload='{"tool_name":"mcp__filesystem__write_file","tool_input":{"path":"runtime/profile.nu","content":"const PROFILE_ROOT = \"/home/alice/.nix-profile\""}}'
+    run bash -c 'printf "%s\n" "$1" | "$2" guard' _ "$payload" "$AGENT_BIN"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"permissionDecision":"deny"'* ]]
+    [[ "$output" == *"Nushell runtime source"* ]]
+}
+
+@test "guard lets apply_patch remove an old path literal" {
+    local payload
+    payload='{"tool_name":"functions.apply_patch","tool_input":{"patch":"*** Begin Patch\n*** Update File: runtime/profile.nu\n@@\n-const PROFILE_ROOT = \"/home/alice/.nix-profile\"\n+const PROFILE_ROOT = \"@profileRoot@\"\n*** End Patch\n"}}'
+    run bash -c 'printf "%s\n" "$1" | "$2" guard' _ "$payload" "$AGENT_BIN"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "guard scopes Nushell source rule away from Markdown evidence" {
+    local payload
+    payload='{"tool_name":"Write","tool_input":{"file_path":"/workspace/evidence.md","content":"Example: const PROFILE_ROOT = \"/home/alice/.nix-profile\""}}'
+    run bash -c 'printf "%s\n" "$1" | "$2" guard' _ "$payload" "$AGENT_BIN"
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }

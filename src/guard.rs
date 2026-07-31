@@ -1,5 +1,5 @@
 //! Deterministic destructive command detection and file path sandboxing for
-//! Claude Code PreToolUse hooks.
+//! agent PreToolUse hooks.
 //!
 //! Reads hook JSON from stdin, evaluates the tool input, and returns structured
 //! JSON to block or allow execution. No LLM evaluation — pure pattern matching
@@ -7,8 +7,9 @@
 //!
 //! Two modes:
 //! - **Bash guard**: Evaluates Bash commands for destructive patterns (always active).
-//! - **File path sandbox**: When `AGENT_ALLOWED_PATHS` is set, restricts Edit/Write/Read/
-//!   NotebookEdit tools to allowed directory prefixes. Inactive in interactive mode.
+//! - **File path sandbox**: When `AGENT_ALLOWED_PATHS` is set, restricts file tools
+//!   (including multi-file patch payloads) to allowed directory prefixes. Inactive
+//!   in interactive mode.
 //!
 //! Configuration is loaded from `.claude/agent-guard.toml` (project-level) or
 //! `~/.claude/agent-guard.toml` (user-level), with embedded defaults as fallback.
@@ -17,7 +18,9 @@ use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(test))]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 // ── Configuration ───────────────────────────────────────
@@ -329,22 +332,45 @@ fn shell_words(segment: &str) -> Vec<String> {
 
 impl GuardConfig {
     /// Load configuration from the hierarchy: project → user → embedded defaults.
+    ///
+    /// Under `cfg(test)` the hierarchy is skipped and the embedded default is
+    /// used directly. A test suite must exercise the policy this crate SHIPS,
+    /// not whichever copy happens to be installed on the machine running it.
+    ///
+    /// This is not hypothetical. `cargo test` runs with the crate root as its
+    /// working directory, which has no `.claude/agent-guard.toml`, so `load()`
+    /// fell through to the user-level copy under `CLAUDE_CONFIG_DIR`. That copy
+    /// is GENERATED -- the flake installs `policy/agent-guard.toml` into the
+    /// profile and the Claude frontdoor writes it into the Claude home -- so it
+    /// lags this repository by exactly one profile rebuild. The result was a
+    /// green suite asserting the behaviour of the PREVIOUS policy: a newly added
+    /// rule was invisible to every test, and a test asserting the old behaviour
+    /// kept passing after the policy contradicted it.
     pub fn load() -> Self {
-        // Try project-level config first
-        if let Some(config) = Self::load_from_project() {
-            return config;
+        #[cfg(test)]
+        {
+            Self::load_from_embedded()
         }
 
-        // Try user-level config
-        if let Some(config) = Self::load_from_user() {
-            return config;
-        }
+        #[cfg(not(test))]
+        {
+            // Try project-level config first
+            if let Some(config) = Self::load_from_project() {
+                return config;
+            }
 
-        // Fall back to embedded defaults
-        Self::load_from_embedded()
+            // Try user-level config
+            if let Some(config) = Self::load_from_user() {
+                return config;
+            }
+
+            // Fall back to embedded defaults
+            Self::load_from_embedded()
+        }
     }
 
     /// Load config from project-level `.claude/agent-guard.toml`.
+    #[cfg(not(test))]
     fn load_from_project() -> Option<Self> {
         let path = Path::new(".claude/agent-guard.toml");
         Self::load_from_file(path)
@@ -355,6 +381,7 @@ impl GuardConfig {
     /// `CLAUDE_CONFIG_DIR` wins when set because it is Claude's documented
     /// configuration-home surface. When it is unset, Claude's supported
     /// `~/.claude` fallback remains available.
+    #[cfg(not(test))]
     fn load_from_user() -> Option<Self> {
         let dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
             Some(v) if !v.is_empty() => PathBuf::from(v),
@@ -369,6 +396,7 @@ impl GuardConfig {
     }
 
     /// Load config from a specific file path.
+    #[cfg(not(test))]
     fn load_from_file(path: &Path) -> Option<Self> {
         let contents = std::fs::read_to_string(path).ok()?;
         toml::from_str(&contents).ok()
@@ -424,7 +452,8 @@ impl GuardConfig {
 /// prints denial JSON to stdout if blocked, exits silently if safe.
 ///
 /// For Bash tools: checks command against destructive patterns.
-/// For Edit/Write/Read/NotebookEdit: validates file_path against `AGENT_ALLOWED_PATHS`.
+/// For file tools: validates every destination against `AGENT_ALLOWED_PATHS` and
+/// applies path-law rules to newly written content.
 pub fn handle_guard() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -442,23 +471,27 @@ pub fn handle_guard() -> Result<()> {
     let tool_name = hook_input.tool_name.as_deref().unwrap_or("");
 
     // File-path tools: validate ALL path fields against allowed directories.
-    // Both file_path and notebook_path are checked when present, preventing
-    // bypass via a payload that smuggles a second path field.
-    if matches!(tool_name, "Edit" | "Write" | "Read" | "NotebookEdit") {
-        let paths: Vec<&String> = hook_input
+    // Patch payloads can name several targets, and MultiEdit can smuggle a
+    // second file path inside an edits array, so both are expanded before the
+    // sandbox and path-law checks.
+    if is_file_path_tool(tool_name) {
+        let patch = hook_input
             .tool_input
             .as_ref()
-            .map(|ti| {
-                let mut v = Vec::new();
-                if let Some(fp) = ti.file_path.as_ref() {
-                    v.push(fp);
-                }
-                if let Some(np) = ti.notebook_path.as_ref() {
-                    v.push(np);
-                }
-                v
-            })
-            .unwrap_or_default();
+            .and_then(ToolInput::patch_payload);
+        let patch_updates = patch.map(parse_apply_patch).unwrap_or_default();
+        let paths = hook_input
+            .tool_input
+            .as_ref()
+            .map(ToolInput::file_paths)
+            .unwrap_or_default()
+            .into_iter()
+            .chain(
+                patch_updates
+                    .iter()
+                    .flat_map(|update| update.paths.iter().map(String::as_str)),
+            )
+            .collect::<Vec<_>>();
 
         if paths.is_empty() {
             // When sandboxing is active, deny file-path tools with no path
@@ -473,7 +506,7 @@ pub fn handle_guard() -> Result<()> {
                 )?;
             }
         } else {
-            for fp in &paths {
+            for fp in paths {
                 if let Some(denial) = evaluate_file_path(tool_name, fp) {
                     emit_denial(denial.reason, denial.decision)?;
                     return Ok(());
@@ -490,27 +523,32 @@ pub fn handle_guard() -> Result<()> {
         // Only the path rules apply here. Running the destructive-command rules
         // over file content would deny writing documentation that merely
         // mentions `rm -rf` or `git reset --hard`.
-        if matches!(tool_name, "Edit" | "Write" | "NotebookEdit") {
+        if is_file_mutation_tool(tool_name) {
             if let Some(ti) = hook_input.tool_input.as_ref() {
-                // The destination counts too: writing into a competing agent
-                // home, or into yazelix's packaged layer instead of its
-                // documented user config, is a path violation regardless of
-                // what the file happens to contain.
-                let payload = [
-                    ti.file_path.as_deref(),
-                    ti.notebook_path.as_deref(),
-                    ti.content.as_deref(),
-                    ti.new_string.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("\n");
-                if !payload.is_empty() {
-                    if let Some(denial) =
-                        evaluate_path_law_for_target(&payload, ti.file_path.as_deref())
-                    {
-                        emit_denial(denial.reason, denial.decision)?;
+                if is_apply_patch_tool(tool_name) {
+                    // Only additions are new policy input. Context and removed
+                    // lines describe the old file; scanning them would make the
+                    // guard deny the patch that removes a violation.
+                    for update in &patch_updates {
+                        if !update.writes_content() {
+                            continue;
+                        }
+                        let payload = format!("{}\n{}", update.target, update.added);
+                        if let Some(denial) =
+                            evaluate_path_law_for_target(&payload, Some(&update.target))
+                        {
+                            emit_denial(denial.reason, denial.decision)?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    for write in ti.file_writes() {
+                        if let Some(denial) =
+                            evaluate_path_law_for_target(&write.payload, Some(write.target))
+                        {
+                            emit_denial(denial.reason, denial.decision)?;
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -619,11 +657,10 @@ const UNPREFIXABLE: &[&str] = &[
     "umask", "unalias", "unset", "until", "wait", "while",
 ];
 
-/// Frontdoor commands that the owner's own instructions invoke bare. RTK.md
-/// shows `rtk ...`; CLAUDE.md's ICM section shows `icm recall` / `icm store`;
-/// meta-workspace-discipline.md requires `meta git ...` for cross-repo work.
-/// Every entry traces to a documented invocation, not to a judgement call.
-const FRONTDOOR_COMMANDS: &[&str] = &["rtk", "meta", "icm", "agent", "yzx"];
+/// The one executable frontdoor. Even profile-owned control commands such as
+/// `meta`, `icm`, `agent`, and `yzx` take this prefix; otherwise an exception
+/// for today's control plane becomes tomorrow's unfiltered command lane.
+const FRONTDOOR_COMMANDS: &[&str] = &["rtk"];
 
 /// Enforce the RTK frontdoor: every command segment runs through `rtk`.
 ///
@@ -683,8 +720,8 @@ pub fn evaluate_rtk_frontdoor(command: &str) -> Option<DenyReason> {
                  cannot: `| rtk grep -c` reads stdin, `rtk ls -la` keeps the mode bits,\n\
                  `rtk env -i` runs a clean-env invocation, `rtk diff -q` compares quietly.\n\
                  \n\
-                 Not flagged: rtk/meta/icm/agent/yzx, and shell builtins and keywords,\n\
-                 which cannot take a prefix. `test` is among them because `rtk test` is\n\
+                 Not flagged: rtk itself, and shell builtins and keywords which cannot\n\
+                 take a prefix. `test` is among them because `rtk test` is\n\
                  the test-RUNNER wrapper and does not evaluate `test -x FILE`.\n\
                  \n\
                  Re-send the command with the prefix; no approval is needed. If a\n\
@@ -715,12 +752,219 @@ struct ToolInput {
     /// rather than inventing one.
     cmd: Option<String>,
     file_path: Option<String>,
+    /// Generic file-tool spelling used by some harnesses.
+    path: Option<String>,
     notebook_path: Option<String>,
     /// Write payload; scanned by the path-law rules so a forbidden path cannot
     /// be introduced by writing a file instead of running a command.
     content: Option<String>,
     /// Edit payload, same reason.
     new_string: Option<String>,
+    /// NotebookEdit spelling for the replacement cell source.
+    new_source: Option<String>,
+    /// Legacy/freeform apply_patch payload spellings. Current Codex reports
+    /// canonical `tool_name: "apply_patch"` with the patch in `command`.
+    input: Option<String>,
+    patch: Option<String>,
+    /// MultiEdit-style nested writes.
+    #[serde(default)]
+    edits: Vec<FileEditInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileEditInput {
+    file_path: Option<String>,
+    path: Option<String>,
+    content: Option<String>,
+    new_string: Option<String>,
+    new_source: Option<String>,
+}
+
+struct FileWrite<'a> {
+    target: &'a str,
+    payload: String,
+}
+
+impl ToolInput {
+    fn patch_payload(&self) -> Option<&str> {
+        self.patch
+            .as_deref()
+            .or(self.input.as_deref())
+            .or(self.command.as_deref())
+    }
+
+    fn file_paths(&self) -> Vec<&str> {
+        [
+            self.file_path.as_deref(),
+            self.path.as_deref(),
+            self.notebook_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.edits.iter().flat_map(|edit| {
+            [edit.file_path.as_deref(), edit.path.as_deref()]
+                .into_iter()
+                .flatten()
+        }))
+        .collect()
+    }
+
+    fn file_writes(&self) -> Vec<FileWrite<'_>> {
+        let target = self
+            .file_path
+            .as_deref()
+            .or(self.path.as_deref())
+            .or(self.notebook_path.as_deref());
+        let mut writes = Vec::new();
+        if let Some(target) = target {
+            let payload = [
+                Some(target),
+                self.content.as_deref(),
+                self.new_string.as_deref(),
+                self.new_source.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+            if !payload.is_empty() {
+                writes.push(FileWrite { target, payload });
+            }
+        }
+        for edit in &self.edits {
+            let Some(target) = edit.file_path.as_deref().or(edit.path.as_deref()) else {
+                continue;
+            };
+            let payload = [
+                Some(target),
+                edit.content.as_deref(),
+                edit.new_string.as_deref(),
+                edit.new_source.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+            if !payload.is_empty() {
+                writes.push(FileWrite { target, payload });
+            }
+        }
+        writes
+    }
+}
+
+/// Return the operation leaf from direct, local-function, or MCP tool names.
+///
+/// Examples:
+/// - `Write` -> `Write`
+/// - `functions.write_file` -> `write_file`
+/// - `mcp__filesystem__write_file` -> `write_file`
+fn tool_leaf_name(tool_name: &str) -> &str {
+    let leaf = tool_name.rsplit("__").next().unwrap_or(tool_name);
+    let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
+    let leaf = leaf.rsplit(':').next().unwrap_or(leaf);
+    leaf.rsplit('/').next().unwrap_or(leaf)
+}
+
+fn is_apply_patch_tool(tool_name: &str) -> bool {
+    tool_leaf_name(tool_name).eq_ignore_ascii_case("apply_patch")
+}
+
+fn is_file_mutation_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_leaf_name(tool_name).to_ascii_lowercase().as_str(),
+        "edit"
+            | "write"
+            | "notebookedit"
+            | "multiedit"
+            | "write_file"
+            | "create_file"
+            | "update_file"
+            | "replace_file"
+            | "edit_file"
+            | "str_replace"
+    ) || is_apply_patch_tool(tool_name)
+}
+
+fn is_file_path_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_leaf_name(tool_name).to_ascii_lowercase().as_str(),
+        "read" | "read_file"
+    ) || is_file_mutation_tool(tool_name)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PatchUpdate {
+    paths: Vec<String>,
+    target: String,
+    added: String,
+    deleted: bool,
+    moved: bool,
+}
+
+impl PatchUpdate {
+    fn writes_content(&self) -> bool {
+        self.moved || (!self.deleted && !self.added.is_empty())
+    }
+}
+
+/// Parse the file boundaries in the structured `apply_patch` format.
+///
+/// The path law consumes only added lines and a move destination. Removed and
+/// context lines describe pre-existing state and must not prevent its repair.
+fn parse_apply_patch(patch: &str) -> Vec<PatchUpdate> {
+    fn finish(current: &mut Option<PatchUpdate>, updates: &mut Vec<PatchUpdate>) {
+        if let Some(update) = current.take() {
+            if !update.target.is_empty() {
+                updates.push(update);
+            }
+        }
+    }
+
+    let mut updates = Vec::new();
+    let mut current: Option<PatchUpdate> = None;
+    for line in patch.lines() {
+        let header = [
+            ("*** Add File: ", false),
+            ("*** Update File: ", false),
+            ("*** Delete File: ", true),
+        ]
+        .into_iter()
+        .find_map(|(prefix, deleted)| line.strip_prefix(prefix).map(|path| (path, deleted)));
+
+        if let Some((path, deleted)) = header {
+            finish(&mut current, &mut updates);
+            let path = path.trim().to_string();
+            current = Some(PatchUpdate {
+                paths: vec![path.clone()],
+                target: path,
+                deleted,
+                ..PatchUpdate::default()
+            });
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Move to: ") {
+            if let Some(update) = current.as_mut() {
+                let path = path.trim().to_string();
+                update.paths.push(path.clone());
+                update.target = path;
+                update.moved = true;
+            }
+            continue;
+        }
+
+        if let Some(update) = current.as_mut() {
+            if let Some(added) = line.strip_prefix('+') {
+                if !update.added.is_empty() {
+                    update.added.push('\n');
+                }
+                update.added.push_str(added);
+            }
+        }
+    }
+    finish(&mut current, &mut updates);
+    updates
 }
 
 #[derive(Serialize)]
@@ -963,29 +1207,69 @@ const NIX_AUTHORED_SURFACE_RULES: &[&str] = &[
     "paths.config_surface_hardcoded",
 ];
 
+/// These rules describe authored file structure, not shell commands. Keeping
+/// them in the shared policy still gives every file-writing adapter one source
+/// of truth, while excluding them from command matching prevents read-only
+/// searches for a forbidden source path from being denied.
+const FILE_PAYLOAD_ONLY_RULES: &[&str] = &[
+    "paths.surface_pinned_in_source",
+    "paths.yazelix_packaged_config_layer",
+];
+
+fn normalized_target(target: Option<&str>) -> Option<&str> {
+    target.map(|path| path.trim().trim_end_matches(['"', '\'', ',', ';']).trim())
+}
+
+fn file_rule_applies_to_target(rule_id: &str, target: Option<&str>) -> bool {
+    let Some(target) = normalized_target(target) else {
+        return !FILE_PAYLOAD_ONLY_RULES.contains(&rule_id);
+    };
+    let slash_target = target.replace('\\', "/");
+    match rule_id {
+        // This rule recognizes Nushell syntax and deliberately has no opinion
+        // about examples in Markdown/TOML or another language's string syntax.
+        "paths.surface_pinned_in_source" => slash_target.ends_with(".nu"),
+        // The fork-only packaged layer is introduced either by writing the Nu
+        // file itself or by retaining/adding its flake reference.
+        "paths.yazelix_packaged_config_layer" => {
+            slash_target.ends_with(".nix")
+                || (slash_target.ends_with(".nu")
+                    && (slash_target.starts_with("nushell/") || slash_target.contains("/nushell/")))
+        }
+        _ => true,
+    }
+}
+
+fn path_rule_matches(pattern: &CompiledPattern, text: &str) -> bool {
+    if pattern.id == "paths.surface_pinned_in_source" {
+        // Comments are evidence and explanation, not executable source. The
+        // rule still scans every non-comment line, including audit candidate
+        // lists: an audit path is a path and must be produced by its owner too.
+        let authored = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        pattern.regex.is_match(&authored)
+    } else {
+        pattern.regex.is_match(text)
+    }
+}
+
 pub fn evaluate_path_law_for_target(text: &str, target: Option<&str>) -> Option<DenyReason> {
     let patterns = CACHED_PATTERNS.get_or_init(|| {
         let config = GuardConfig::load();
         config.compile_patterns()
     });
 
-    let authored_in_nix = target.is_some_and(|path| {
-        path.trim()
-            .trim_end_matches(['"', '\'', ',', ';'])
-            .ends_with(".nix")
-    });
-    let authored_in_nushell = target.is_some_and(|path| {
-        path.trim()
-            .trim_end_matches(['"', '\'', ',', ';'])
-            .ends_with(".nu")
-    });
+    let authored_in_nix = normalized_target(target).is_some_and(|path| path.ends_with(".nix"));
 
     patterns
         .iter()
         .filter(|p| p.id.starts_with("paths."))
-        .filter(|p| p.id != "paths.surface_pinned_in_source" || authored_in_nushell)
         .filter(|p| !(authored_in_nix && NIX_AUTHORED_SURFACE_RULES.contains(&p.id.as_str())))
-        .find(|p| p.regex.is_match(text))
+        .filter(|p| file_rule_applies_to_target(&p.id, target))
+        .find(|p| path_rule_matches(p, text))
         .map(|p| DenyReason {
             reason: p.message.clone(),
             decision: p.decision,
@@ -1013,11 +1297,7 @@ pub fn evaluate_command(command: &str) -> Option<DenyReason> {
 /// Evaluate a single command segment using compiled regex patterns.
 fn evaluate_segment(segment: &str, patterns: &[CompiledPattern]) -> Option<DenyReason> {
     for pattern in patterns {
-        // Path-law rules are for file payloads. Applying them to shell
-        // commands makes a command that merely contains an absolute argument
-        // look like a Nushell source edit and bypasses the target-aware
-        // filtering in evaluate_path_law_for_target().
-        if pattern.id.starts_with("paths.") {
+        if FILE_PAYLOAD_ONLY_RULES.contains(&pattern.id.as_str()) {
             continue;
         }
         if pattern.regex.is_match(segment) {
@@ -1537,9 +1817,11 @@ message = "??"
     // ── Denial reason content ─────────────────────────
 
     #[test]
-    fn force_push_reason_suggests_lease() {
+    fn force_push_reason_names_the_non_rewriting_rtk_remedy() {
         let denial = evaluate_command("git push --force").unwrap();
-        assert!(denial.reason.contains("Reconcile"));
+        assert!(denial.reason.contains("rtk git pull --rebase"));
+        assert!(denial.reason.contains("rtk git push"));
+        assert!(!denial.reason.contains("operator"));
     }
 
     #[test]
@@ -1919,12 +2201,14 @@ message = "Custom reset message"
         }
 
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct LegacyPattern {
             #[serde(default)]
             validator: Option<LegacyValidator>,
         }
 
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         #[serde(tag = "type")]
         enum LegacyValidator {
             #[serde(rename = "not_contains")]
@@ -2548,14 +2832,49 @@ message = "medium priority"
         // Installing the project's own flake OUTPUT is the documented cutover,
         // and read-only profile inspection must stay available.
         for cmd in [
-            "rtk nix profile add --refresh --profile /p github:FlexNetOS/yazelix#lifeos_foundation_yzx",
+            "nix profile add --refresh --profile /p github:FlexNetOS/yazelix#lifeos_foundation_yzx",
             "nix profile list --profile /p --json",
             "nix run nixpkgs#ripgrep -- --version",
             "rtk bun install",
             "rtk bun add lodash",
+            "rtk bun x --bun gitnexus@latest analyze",
             "cargo build --release",
             "cargo run --bin agent",
             "go build ./...",
+        ] {
+            assert!(evaluate_command(cmd).is_none(), "must stay allowed: {cmd}");
+        }
+    }
+
+    #[test]
+    fn node_lane_denies_the_package_managers_this_profile_does_not_have() {
+        // The flake contract asserts npm, npx, pnpm, corepack and yarn are
+        // ABSENT from the profile, so these cannot run at all -- denying them
+        // with the bun remedy is cheaper than a command-not-found and a guess.
+        // A project-local `npm install` used to be asserted ALLOWED here; that
+        // assertion outlived the profile that made it true.
+        for cmd in [
+            "npm install",
+            "npm install lodash",
+            "rtk npm run build",
+            "rtk proxy -- npx cowsay hi",
+            "pnpm add left-pad",
+            "CI=1 yarn add left-pad",
+            "corepack enable",
+        ] {
+            let denial =
+                evaluate_command(cmd).unwrap_or_else(|| panic!("node lane must deny: {cmd}"));
+            assert_eq!(denial.decision, Decision::Deny, "{cmd}");
+        }
+
+        // Anchored at the segment head, so a search whose PATTERN names one of
+        // the absent tools is an ordinary command. Matching the bare name
+        // anywhere in the segment was tried first and denied these.
+        for cmd in [
+            "rtk grep -c npm README.md",
+            "rtk grep -rn 'pnpm-lock' .",
+            "rtk bun install",
+            "rtk bun x --bun gitnexus@latest analyze",
         ] {
             assert!(evaluate_command(cmd).is_none(), "must stay allowed: {cmd}");
         }
@@ -2573,6 +2892,35 @@ message = "medium priority"
             .map(|p| p.id.as_str())
             .collect();
         assert!(asks.is_empty(), "these rules still escalate: {asks:?}");
+    }
+
+    #[test]
+    fn denial_messages_keep_executable_remedies_behind_rtk() {
+        let config = GuardConfig::load();
+        let forbidden = [
+            "\n- git ",
+            "\n- meta ",
+            "\n- cargo ",
+            "\n- jq ",
+            "\n- nix ",
+            "\n  git ",
+            "\n  meta ",
+            "\n  cargo ",
+            "\n  jq ",
+            "\n  nix ",
+            "'claude --version'",
+            "operator-approved",
+        ];
+
+        for pattern in config.patterns {
+            for bare in forbidden {
+                assert!(
+                    !pattern.message.contains(bare),
+                    "{} emits a non-RTK or human-gated remedy containing {bare:?}",
+                    pattern.id
+                );
+            }
+        }
     }
 
     #[test]
@@ -2598,14 +2946,35 @@ message = "medium priority"
     fn rtk_frontdoor_accepts_prefixed_and_frontdoor_commands() {
         assert!(evaluate_rtk_frontdoor("rtk git add . && rtk git commit -m \"m\"").is_none());
         assert!(evaluate_rtk_frontdoor("rtk cargo build && rtk cargo test").is_none());
-        // Documented bare invocations: meta-workspace-discipline.md requires
-        // `meta git ...`; CLAUDE.md's ICM section shows `icm store ...`.
-        assert!(evaluate_rtk_frontdoor("meta git status").is_none());
-        assert!(evaluate_rtk_frontdoor("icm recall \"paths\"").is_none());
+        for command in [
+            "rtk meta --version",
+            "rtk icm recall \"paths\"",
+            "rtk agent --version",
+            "rtk yzx --version",
+        ] {
+            assert!(
+                evaluate_rtk_frontdoor(command).is_none(),
+                "prefixed control command denied: {command}"
+            );
+        }
         // An absolute path to the frontdoor is still the frontdoor.
         assert!(
             evaluate_rtk_frontdoor("/home/someone/.nix-profile/toolbin/rtk git status").is_none()
         );
+    }
+
+    #[test]
+    fn rtk_frontdoor_has_no_bare_control_command_bypass() {
+        for command in [
+            "meta --version",
+            "icm recall \"paths\"",
+            "agent --version",
+            "yzx --version",
+        ] {
+            let denial = evaluate_rtk_frontdoor(command)
+                .unwrap_or_else(|| panic!("bare control command escaped: {command}"));
+            assert_eq!(denial.decision, Decision::Deny, "{command}");
+        }
     }
 
     #[test]
@@ -2718,5 +3087,194 @@ message = "medium priority"
         // ...while the same shapes under a workspace are ordinary paths.
         assert!(evaluate_path_law("/home/alice/work/src/main.rs").is_none());
         assert!(evaluate_path_law("/srv/build/target").is_none());
+    }
+
+    #[test]
+    fn nushell_path_law_has_no_binding_or_audit_loophole() {
+        for source in [
+            r#"let root = "/home/alice/runtime""#,
+            r#"const PROFILE_ROOT = '/home/alice/profile'"#,
+            r#"mut state = "/run/user/4242/state""#,
+            r#"let retired = ["/nix/store/retired"]"#,
+            r#"$env.CARGO_HOME = "/home/alice/cargo""#,
+            r#"let policy = "/etc/systemd/user""#,
+            r#"let candidate = "/usr/bin/nvim""#,
+            r#"let scratch = "/tmp/runtime""#,
+            r#"let bare = /srv/runtime"#,
+            r#"let raw = r#'/opt/runtime data'#"#,
+            r#"let interpolated = $"/var/lib/(whoami)""#,
+            r#"let backtick = `/nix/store/runtime path`"#,
+            r#"let roots = [/etc/runtime /usr/runtime]"#,
+            r#"let record = { path: /tmp/runtime }"#,
+            r#"let filesystem_root = "/""#,
+        ] {
+            assert!(
+                evaluate_path_law_for_target(source, Some("/w/runtime.nu")).is_some(),
+                "Nushell literal escaped: {source}"
+            );
+        }
+
+        for (source, target) in [
+            (r#"let root = "@profileRoot@""#, "/w/runtime.nu"),
+            (
+                r#"# audit example: const ROOT = "/home/alice/example""#,
+                "/w/runtime.nu",
+            ),
+            (r#"const ROOT = "/home/alice/example""#, "/w/evidence.md"),
+            (r#"const ROOT = "/home/alice/example""#, "/w/flake.nix"),
+            (
+                r#"let upstream = "https://www.nushell.sh/book/operators""#,
+                "/w/runtime.nu",
+            ),
+        ] {
+            assert!(
+                evaluate_path_law_for_target(source, Some(target)).is_none(),
+                "non-runtime evidence was denied: {target}: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_only_rules_do_not_deny_read_only_commands() {
+        for command in [
+            r#"rtk rg -n '"/home/' nushell"#,
+            "rtk rg -n 'nushell/config.nu' flake.nix",
+        ] {
+            assert!(
+                evaluate_command(command).is_none(),
+                "file-only rule denied a command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_patch_scans_each_target_and_only_new_content() {
+        let introducing = r#"*** Begin Patch
+*** Update File: runtime/host_policy.nu
+@@
+-const PROFILE_ROOT = "@profileRoot@"
++const PROFILE_ROOT = "/home/alice/.nix-profile"
+*** End Patch
+"#;
+        let updates = parse_apply_patch(introducing);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].target, "runtime/host_policy.nu");
+        assert_eq!(
+            updates[0].added,
+            r#"const PROFILE_ROOT = "/home/alice/.nix-profile""#
+        );
+        let payload = format!("{}\n{}", updates[0].target, updates[0].added);
+        assert!(
+            evaluate_path_law_for_target(&payload, Some(&updates[0].target)).is_some(),
+            "apply_patch addition escaped the path law"
+        );
+
+        let removing = r#"*** Begin Patch
+*** Update File: runtime/host_policy.nu
+@@
+-const PROFILE_ROOT = "/home/alice/.nix-profile"
++const PROFILE_ROOT = "@profileRoot@"
+*** End Patch
+"#;
+        let update = parse_apply_patch(removing).pop().expect("one update");
+        let payload = format!("{}\n{}", update.target, update.added);
+        assert!(
+            evaluate_path_law_for_target(&payload, Some(&update.target)).is_none(),
+            "old removed content must not prevent its repair"
+        );
+
+        let deleting = parse_apply_patch(
+            "*** Begin Patch\n*** Delete File: nushell/retired.nu\n*** End Patch\n",
+        );
+        assert_eq!(deleting.len(), 1);
+        assert!(!deleting[0].writes_content());
+    }
+
+    #[test]
+    fn patch_moves_and_multiedit_cannot_smuggle_a_second_target() {
+        let moved = parse_apply_patch(
+            "*** Begin Patch\n*** Update File: safe.nu\n*** Move to: nushell/runtime.nu\n*** End Patch\n",
+        );
+        assert_eq!(
+            moved[0].paths,
+            vec!["safe.nu".to_string(), "nushell/runtime.nu".to_string()]
+        );
+        assert!(moved[0].writes_content());
+
+        let input: ToolInput = serde_json::from_str(
+            r#"{
+                "file_path": "/w/safe.nu",
+                "new_string": "let ok = \"@root@\"",
+                "edits": [{
+                    "file_path": "/w/second.nu",
+                    "new_string": "const ROOT = \"/home/alice/hidden\""
+                }]
+            }"#,
+        )
+        .expect("valid MultiEdit payload");
+        let writes = input.file_writes();
+        assert_eq!(writes.len(), 2);
+        assert!(
+            writes.iter().any(|write| {
+                evaluate_path_law_for_target(&write.payload, Some(write.target)).is_some()
+            }),
+            "nested edit escaped the path law"
+        );
+    }
+
+    #[test]
+    fn codex_apply_patch_uses_the_documented_command_payload() {
+        let input: ToolInput = serde_json::from_str(
+            r#"{
+                "command": "*** Begin Patch\n*** Update File: runtime.nu\n@@\n+const ROOT = \"/srv/runtime\"\n*** End Patch\n"
+            }"#,
+        )
+        .expect("valid Codex apply_patch payload");
+
+        assert_eq!(
+            input.patch_payload(),
+            Some(
+                "*** Begin Patch\n*** Update File: runtime.nu\n@@\n+const ROOT = \"/srv/runtime\"\n*** End Patch\n"
+            )
+        );
+    }
+
+    #[test]
+    fn namespaced_file_tools_are_normalized_by_operation_leaf() {
+        for tool in [
+            "Write",
+            "functions.write_file",
+            "functions::edit_file",
+            "mcp__filesystem__write_file",
+            "mcp__filesystem__str_replace",
+        ] {
+            assert!(
+                is_file_mutation_tool(tool),
+                "writer tool was not normalized: {tool}"
+            );
+            assert!(
+                is_file_path_tool(tool),
+                "writer tool skipped path validation: {tool}"
+            );
+        }
+
+        for tool in ["Read", "functions.read_file", "mcp__filesystem__read_file"] {
+            assert!(
+                is_file_path_tool(tool),
+                "reader tool skipped path validation: {tool}"
+            );
+            assert!(
+                !is_file_mutation_tool(tool),
+                "reader tool was treated as a writer: {tool}"
+            );
+        }
+
+        for tool in [
+            "apply_patch",
+            "functions.apply_patch",
+            "mcp__filesystem__apply_patch",
+        ] {
+            assert!(is_apply_patch_tool(tool), "patch tool escaped: {tool}");
+        }
     }
 }
