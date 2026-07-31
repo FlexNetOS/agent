@@ -7,8 +7,9 @@
 //!
 //! Two modes:
 //! - **Bash guard**: Evaluates Bash commands for destructive patterns (always active).
-//! - **File path sandbox**: When `AGENT_ALLOWED_PATHS` is set, restricts Edit/Write/Read/
-//!   NotebookEdit tools to allowed directory prefixes. Inactive in interactive mode.
+//! - **File path sandbox**: When `AGENT_ALLOWED_PATHS` is set, restricts file tools
+//!   (including multi-file patch payloads) to allowed directory prefixes. Inactive
+//!   in interactive mode.
 //!
 //! Configuration is loaded from `.claude/agent-guard.toml` (project-level) or
 //! `~/.claude/agent-guard.toml` (user-level), with embedded defaults as fallback.
@@ -446,7 +447,8 @@ impl GuardConfig {
 /// prints denial JSON to stdout if blocked, exits silently if safe.
 ///
 /// For Bash tools: checks command against destructive patterns.
-/// For Edit/Write/Read/NotebookEdit: validates file_path against `AGENT_ALLOWED_PATHS`.
+/// For file tools: validates every destination against `AGENT_ALLOWED_PATHS` and
+/// applies path-law rules to newly written content.
 pub fn handle_guard() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -464,23 +466,27 @@ pub fn handle_guard() -> Result<()> {
     let tool_name = hook_input.tool_name.as_deref().unwrap_or("");
 
     // File-path tools: validate ALL path fields against allowed directories.
-    // Both file_path and notebook_path are checked when present, preventing
-    // bypass via a payload that smuggles a second path field.
-    if matches!(tool_name, "Edit" | "Write" | "Read" | "NotebookEdit") {
-        let paths: Vec<&String> = hook_input
+    // Patch payloads can name several targets, and MultiEdit can smuggle a
+    // second file path inside an edits array, so both are expanded before the
+    // sandbox and path-law checks.
+    if is_file_path_tool(tool_name) {
+        let patch = hook_input
             .tool_input
             .as_ref()
-            .map(|ti| {
-                let mut v = Vec::new();
-                if let Some(fp) = ti.file_path.as_ref() {
-                    v.push(fp);
-                }
-                if let Some(np) = ti.notebook_path.as_ref() {
-                    v.push(np);
-                }
-                v
-            })
-            .unwrap_or_default();
+            .and_then(ToolInput::patch_payload);
+        let patch_updates = patch.map(parse_apply_patch).unwrap_or_default();
+        let paths = hook_input
+            .tool_input
+            .as_ref()
+            .map(ToolInput::file_paths)
+            .unwrap_or_default()
+            .into_iter()
+            .chain(
+                patch_updates
+                    .iter()
+                    .flat_map(|update| update.paths.iter().map(String::as_str)),
+            )
+            .collect::<Vec<_>>();
 
         if paths.is_empty() {
             // When sandboxing is active, deny file-path tools with no path
@@ -495,7 +501,7 @@ pub fn handle_guard() -> Result<()> {
                 )?;
             }
         } else {
-            for fp in &paths {
+            for fp in paths {
                 if let Some(denial) = evaluate_file_path(tool_name, fp) {
                     emit_denial(denial.reason, denial.decision)?;
                     return Ok(());
@@ -512,27 +518,32 @@ pub fn handle_guard() -> Result<()> {
         // Only the path rules apply here. Running the destructive-command rules
         // over file content would deny writing documentation that merely
         // mentions `rm -rf` or `git reset --hard`.
-        if matches!(tool_name, "Edit" | "Write" | "NotebookEdit") {
+        if is_file_mutation_tool(tool_name) {
             if let Some(ti) = hook_input.tool_input.as_ref() {
-                // The destination counts too: writing into a competing agent
-                // home, or into yazelix's packaged layer instead of its
-                // documented user config, is a path violation regardless of
-                // what the file happens to contain.
-                let payload = [
-                    ti.file_path.as_deref(),
-                    ti.notebook_path.as_deref(),
-                    ti.content.as_deref(),
-                    ti.new_string.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("\n");
-                if !payload.is_empty() {
-                    if let Some(denial) =
-                        evaluate_path_law_for_target(&payload, ti.file_path.as_deref())
-                    {
-                        emit_denial(denial.reason, denial.decision)?;
+                if is_apply_patch_tool(tool_name) {
+                    // Only additions are new policy input. Context and removed
+                    // lines describe the old file; scanning them would make the
+                    // guard deny the patch that removes a violation.
+                    for update in &patch_updates {
+                        if !update.writes_content() {
+                            continue;
+                        }
+                        let payload = format!("{}\n{}", update.target, update.added);
+                        if let Some(denial) =
+                            evaluate_path_law_for_target(&payload, Some(&update.target))
+                        {
+                            emit_denial(denial.reason, denial.decision)?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    for write in ti.file_writes() {
+                        if let Some(denial) =
+                            evaluate_path_law_for_target(&write.payload, Some(write.target))
+                        {
+                            emit_denial(denial.reason, denial.decision)?;
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -737,12 +748,193 @@ struct ToolInput {
     /// rather than inventing one.
     cmd: Option<String>,
     file_path: Option<String>,
+    /// Generic file-tool spelling used by some harnesses.
+    path: Option<String>,
     notebook_path: Option<String>,
     /// Write payload; scanned by the path-law rules so a forbidden path cannot
     /// be introduced by writing a file instead of running a command.
     content: Option<String>,
     /// Edit payload, same reason.
     new_string: Option<String>,
+    /// NotebookEdit spelling for the replacement cell source.
+    new_source: Option<String>,
+    /// Codex/functions.apply_patch freeform payload spellings.
+    input: Option<String>,
+    patch: Option<String>,
+    /// MultiEdit-style nested writes.
+    #[serde(default)]
+    edits: Vec<FileEditInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileEditInput {
+    file_path: Option<String>,
+    path: Option<String>,
+    content: Option<String>,
+    new_string: Option<String>,
+    new_source: Option<String>,
+}
+
+struct FileWrite<'a> {
+    target: &'a str,
+    payload: String,
+}
+
+impl ToolInput {
+    fn patch_payload(&self) -> Option<&str> {
+        self.patch.as_deref().or(self.input.as_deref())
+    }
+
+    fn file_paths(&self) -> Vec<&str> {
+        [
+            self.file_path.as_deref(),
+            self.path.as_deref(),
+            self.notebook_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.edits.iter().flat_map(|edit| {
+            [edit.file_path.as_deref(), edit.path.as_deref()]
+                .into_iter()
+                .flatten()
+        }))
+        .collect()
+    }
+
+    fn file_writes(&self) -> Vec<FileWrite<'_>> {
+        let target = self
+            .file_path
+            .as_deref()
+            .or(self.path.as_deref())
+            .or(self.notebook_path.as_deref());
+        let mut writes = Vec::new();
+        if let Some(target) = target {
+            let payload = [
+                Some(target),
+                self.content.as_deref(),
+                self.new_string.as_deref(),
+                self.new_source.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+            if !payload.is_empty() {
+                writes.push(FileWrite { target, payload });
+            }
+        }
+        for edit in &self.edits {
+            let Some(target) = edit.file_path.as_deref().or(edit.path.as_deref()) else {
+                continue;
+            };
+            let payload = [
+                Some(target),
+                edit.content.as_deref(),
+                edit.new_string.as_deref(),
+                edit.new_source.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+            if !payload.is_empty() {
+                writes.push(FileWrite { target, payload });
+            }
+        }
+        writes
+    }
+}
+
+fn is_apply_patch_tool(tool_name: &str) -> bool {
+    tool_name == "apply_patch" || tool_name.ends_with(".apply_patch")
+}
+
+fn is_file_mutation_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Edit" | "Write" | "NotebookEdit" | "MultiEdit" | "write_file"
+    ) || is_apply_patch_tool(tool_name)
+}
+
+fn is_file_path_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Edit" | "Write" | "Read" | "NotebookEdit" | "MultiEdit" | "write_file"
+    ) || is_apply_patch_tool(tool_name)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PatchUpdate {
+    paths: Vec<String>,
+    target: String,
+    added: String,
+    deleted: bool,
+    moved: bool,
+}
+
+impl PatchUpdate {
+    fn writes_content(&self) -> bool {
+        self.moved || (!self.deleted && !self.added.is_empty())
+    }
+}
+
+/// Parse the file boundaries in the structured `apply_patch` format.
+///
+/// The path law consumes only added lines and a move destination. Removed and
+/// context lines describe pre-existing state and must not prevent its repair.
+fn parse_apply_patch(patch: &str) -> Vec<PatchUpdate> {
+    fn finish(current: &mut Option<PatchUpdate>, updates: &mut Vec<PatchUpdate>) {
+        if let Some(update) = current.take() {
+            if !update.target.is_empty() {
+                updates.push(update);
+            }
+        }
+    }
+
+    let mut updates = Vec::new();
+    let mut current: Option<PatchUpdate> = None;
+    for line in patch.lines() {
+        let header = [
+            ("*** Add File: ", false),
+            ("*** Update File: ", false),
+            ("*** Delete File: ", true),
+        ]
+        .into_iter()
+        .find_map(|(prefix, deleted)| line.strip_prefix(prefix).map(|path| (path, deleted)));
+
+        if let Some((path, deleted)) = header {
+            finish(&mut current, &mut updates);
+            let path = path.trim().to_string();
+            current = Some(PatchUpdate {
+                paths: vec![path.clone()],
+                target: path,
+                deleted,
+                ..PatchUpdate::default()
+            });
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Move to: ") {
+            if let Some(update) = current.as_mut() {
+                let path = path.trim().to_string();
+                update.paths.push(path.clone());
+                update.target = path;
+                update.moved = true;
+            }
+            continue;
+        }
+
+        if let Some(update) = current.as_mut() {
+            if let Some(added) = line.strip_prefix('+') {
+                if !update.added.is_empty() {
+                    update.added.push('\n');
+                }
+                update.added.push_str(added);
+            }
+        }
+    }
+    finish(&mut current, &mut updates);
+    updates
 }
 
 #[derive(Serialize)]
@@ -985,23 +1177,69 @@ const NIX_AUTHORED_SURFACE_RULES: &[&str] = &[
     "paths.config_surface_hardcoded",
 ];
 
+/// These rules describe authored file structure, not shell commands. Keeping
+/// them in the shared policy still gives every file-writing adapter one source
+/// of truth, while excluding them from command matching prevents read-only
+/// searches for a forbidden source path from being denied.
+const FILE_PAYLOAD_ONLY_RULES: &[&str] = &[
+    "paths.surface_pinned_in_source",
+    "paths.yazelix_packaged_config_layer",
+];
+
+fn normalized_target(target: Option<&str>) -> Option<&str> {
+    target.map(|path| path.trim().trim_end_matches(['"', '\'', ',', ';']).trim())
+}
+
+fn file_rule_applies_to_target(rule_id: &str, target: Option<&str>) -> bool {
+    let Some(target) = normalized_target(target) else {
+        return !FILE_PAYLOAD_ONLY_RULES.contains(&rule_id);
+    };
+    let slash_target = target.replace('\\', "/");
+    match rule_id {
+        // This rule recognizes Nushell syntax and deliberately has no opinion
+        // about examples in Markdown/TOML or another language's string syntax.
+        "paths.surface_pinned_in_source" => slash_target.ends_with(".nu"),
+        // The fork-only packaged layer is introduced either by writing the Nu
+        // file itself or by retaining/adding its flake reference.
+        "paths.yazelix_packaged_config_layer" => {
+            slash_target.ends_with(".nix")
+                || (slash_target.ends_with(".nu")
+                    && (slash_target.starts_with("nushell/") || slash_target.contains("/nushell/")))
+        }
+        _ => true,
+    }
+}
+
+fn path_rule_matches(pattern: &CompiledPattern, text: &str) -> bool {
+    if pattern.id == "paths.surface_pinned_in_source" {
+        // Comments are evidence and explanation, not executable source. The
+        // rule still scans every non-comment line, including audit candidate
+        // lists: an audit path is a path and must be produced by its owner too.
+        let authored = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        pattern.regex.is_match(&authored)
+    } else {
+        pattern.regex.is_match(text)
+    }
+}
+
 pub fn evaluate_path_law_for_target(text: &str, target: Option<&str>) -> Option<DenyReason> {
     let patterns = CACHED_PATTERNS.get_or_init(|| {
         let config = GuardConfig::load();
         config.compile_patterns()
     });
 
-    let authored_in_nix = target.is_some_and(|path| {
-        path.trim()
-            .trim_end_matches(['"', '\'', ',', ';'])
-            .ends_with(".nix")
-    });
+    let authored_in_nix = normalized_target(target).is_some_and(|path| path.ends_with(".nix"));
 
     patterns
         .iter()
         .filter(|p| p.id.starts_with("paths."))
         .filter(|p| !(authored_in_nix && NIX_AUTHORED_SURFACE_RULES.contains(&p.id.as_str())))
-        .find(|p| p.regex.is_match(text))
+        .filter(|p| file_rule_applies_to_target(&p.id, target))
+        .find(|p| path_rule_matches(p, text))
         .map(|p| DenyReason {
             reason: p.message.clone(),
             decision: p.decision,
@@ -1029,6 +1267,9 @@ pub fn evaluate_command(command: &str) -> Option<DenyReason> {
 /// Evaluate a single command segment using compiled regex patterns.
 fn evaluate_segment(segment: &str, patterns: &[CompiledPattern]) -> Option<DenyReason> {
     for pattern in patterns {
+        if FILE_PAYLOAD_ONLY_RULES.contains(&pattern.id.as_str()) {
+            continue;
+        }
         if pattern.regex.is_match(segment) {
             // Additional validation if required
             if let Some(ref validator) = pattern.validator {
