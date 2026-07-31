@@ -693,8 +693,7 @@ id = "paths.code_discipline_generated_copy"
 priority = 200
 enabled = true
 decision = "deny"
-matcher = { type = "regex", pattern = '(\A|(^|[\s;&|(])(cp|mv|ln|install|tee|touch|rsync)\s[^;&|]*|>>?\s*)[^\s;&|]*var/lib/claude/CODE-DISCIPLINE\.md' }
-validator = { type = "not_contains", value = ".claude/CODE-DISCIPLINE.md" }
+matcher = { type = "regex", pattern = '\A[^\s;&|]*var/lib/claude/CODE-DISCIPLINE\.md' }
 message = """
 Regenerate this copy from its canonical source instead of editing it:
 
@@ -711,8 +710,13 @@ session:
 drift silently -- the same failure the generated user-level policy copy already
 caused once. Editing a generated file in place creates a second owner of it.
 
-A cp whose source is the canonical file is allowed, and reading, listing or
-grepping the derived copy is not matched here -- only writing it.
+This matches a file-writing tool whose TARGET is this copy, because the target
+is the first line of the payload the rule sees. It deliberately does not match
+the path anywhere else: a document that quotes the cp command above, a read, a
+list, a grep, and a shell write are all allowed. Matching write verbs anywhere
+in the payload was tried first and had to be withdrawn -- validators do not run
+on file payloads, so the rule denied every document that quoted its own remedy,
+including this rule's own KB record.
 """
 
 [[patterns]]
@@ -720,7 +724,7 @@ id = "paths.surface_pinned_in_source"
 priority = 200
 enabled = true
 decision = "deny"
-matcher = { type = "regex", pattern = '["\x27]/' }
+matcher = { type = "regex", pattern = '(^|[\s=\[({,;"\x27\x60])/(?:[-A-Za-z0-9._~@+]|["\x27\x60])' }
 message = """
 This pins an absolute path inside a Nushell runtime source file. Upstream's startup
 boundary is "Owned by runtime/yzx/ (Nix substitutes paths; Rust owns wiring and
@@ -740,10 +744,12 @@ consumer; a second attribute set repeating it is the duplicate owner Method 6
 forbids.
 
 This file-only rule is target-aware in evaluate_path_law_for_target(): it scans
-every non-comment line of a .nu destination, including let/const/list/audit
-forms, and scans only added lines in apply_patch payloads. A removed violation
-therefore stays removable. Markdown evidence and .nix producer values are not
-Nushell source and are not matched here.
+every non-comment line of a .nu destination, including quoted, bare, raw,
+interpolated, backtick, list, record, let/const and audit forms. The token
+boundary deliberately excludes `://`, so a URL is not mistaken for a path. It
+scans only added lines in apply_patch payloads, so a removed violation stays
+removable. Markdown evidence and .nix producer values are not Nushell source
+and are not matched here.
 """
 
 [[patterns]]
