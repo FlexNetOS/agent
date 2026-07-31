@@ -329,19 +329,41 @@ fn shell_words(segment: &str) -> Vec<String> {
 
 impl GuardConfig {
     /// Load configuration from the hierarchy: project → user → embedded defaults.
+    ///
+    /// Under `cfg(test)` the hierarchy is skipped and the embedded default is
+    /// used directly. A test suite must exercise the policy this crate SHIPS,
+    /// not whichever copy happens to be installed on the machine running it.
+    ///
+    /// This is not hypothetical. `cargo test` runs with the crate root as its
+    /// working directory, which has no `.claude/agent-guard.toml`, so `load()`
+    /// fell through to the user-level copy under `CLAUDE_CONFIG_DIR`. That copy
+    /// is GENERATED -- the flake installs `policy/agent-guard.toml` into the
+    /// profile and the Claude frontdoor writes it into the Claude home -- so it
+    /// lags this repository by exactly one profile rebuild. The result was a
+    /// green suite asserting the behaviour of the PREVIOUS policy: a newly added
+    /// rule was invisible to every test, and a test asserting the old behaviour
+    /// kept passing after the policy contradicted it.
     pub fn load() -> Self {
-        // Try project-level config first
-        if let Some(config) = Self::load_from_project() {
-            return config;
+        #[cfg(test)]
+        {
+            return Self::load_from_embedded();
         }
 
-        // Try user-level config
-        if let Some(config) = Self::load_from_user() {
-            return config;
-        }
+        #[cfg(not(test))]
+        {
+            // Try project-level config first
+            if let Some(config) = Self::load_from_project() {
+                return config;
+            }
 
-        // Fall back to embedded defaults
-        Self::load_from_embedded()
+            // Try user-level config
+            if let Some(config) = Self::load_from_user() {
+                return config;
+            }
+
+            // Fall back to embedded defaults
+            Self::load_from_embedded()
+        }
     }
 
     /// Load config from project-level `.claude/agent-guard.toml`.
@@ -2538,11 +2560,46 @@ message = "medium priority"
             "nix profile add --refresh --profile /p github:FlexNetOS/yazelix#lifeos_foundation_yzx",
             "nix profile list --profile /p --json",
             "nix run nixpkgs#ripgrep -- --version",
-            "npm install",
-            "npm install lodash",
+            "rtk bun install",
+            "rtk bun add lodash",
+            "rtk bunx --bun gitnexus@latest analyze",
             "cargo build --release",
             "cargo run --bin agent",
             "go build ./...",
+        ] {
+            assert!(evaluate_command(cmd).is_none(), "must stay allowed: {cmd}");
+        }
+    }
+
+    #[test]
+    fn node_lane_denies_the_package_managers_this_profile_does_not_have() {
+        // The flake contract asserts npm, npx, pnpm, corepack and yarn are
+        // ABSENT from the profile, so these cannot run at all -- denying them
+        // with the bun remedy is cheaper than a command-not-found and a guess.
+        // A project-local `npm install` used to be asserted ALLOWED here; that
+        // assertion outlived the profile that made it true.
+        for cmd in [
+            "npm install",
+            "npm install lodash",
+            "rtk npm run build",
+            "rtk proxy -- npx cowsay hi",
+            "pnpm add left-pad",
+            "CI=1 yarn add left-pad",
+            "corepack enable",
+        ] {
+            let denial =
+                evaluate_command(cmd).unwrap_or_else(|| panic!("node lane must deny: {cmd}"));
+            assert_eq!(denial.decision, Decision::Deny, "{cmd}");
+        }
+
+        // Anchored at the segment head, so a search whose PATTERN names one of
+        // the absent tools is an ordinary command. Matching the bare name
+        // anywhere in the segment was tried first and denied these.
+        for cmd in [
+            "rtk grep -c npm README.md",
+            "rtk grep -rn 'pnpm-lock' .",
+            "rtk bun install",
+            "rtk bunx --bun gitnexus@latest analyze",
         ] {
             assert!(evaluate_command(cmd).is_none(), "must stay allowed: {cmd}");
         }
