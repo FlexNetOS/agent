@@ -1,5 +1,5 @@
 //! Deterministic destructive command detection and file path sandboxing for
-//! Claude Code PreToolUse hooks.
+//! agent PreToolUse hooks.
 //!
 //! Reads hook JSON from stdin, evaluates the tool input, and returns structured
 //! JSON to block or allow execution. No LLM evaluation — pure pattern matching
@@ -657,11 +657,10 @@ const UNPREFIXABLE: &[&str] = &[
     "umask", "unalias", "unset", "until", "wait", "while",
 ];
 
-/// Frontdoor commands that the owner's own instructions invoke bare. RTK.md
-/// shows `rtk ...`; CLAUDE.md's ICM section shows `icm recall` / `icm store`;
-/// meta-workspace-discipline.md requires `meta git ...` for cross-repo work.
-/// Every entry traces to a documented invocation, not to a judgement call.
-const FRONTDOOR_COMMANDS: &[&str] = &["rtk", "meta", "icm", "agent", "yzx"];
+/// The one executable frontdoor. Even profile-owned control commands such as
+/// `meta`, `icm`, `agent`, and `yzx` take this prefix; otherwise an exception
+/// for today's control plane becomes tomorrow's unfiltered command lane.
+const FRONTDOOR_COMMANDS: &[&str] = &["rtk"];
 
 /// Enforce the RTK frontdoor: every command segment runs through `rtk`.
 ///
@@ -721,8 +720,8 @@ pub fn evaluate_rtk_frontdoor(command: &str) -> Option<DenyReason> {
                  cannot: `| rtk grep -c` reads stdin, `rtk ls -la` keeps the mode bits,\n\
                  `rtk env -i` runs a clean-env invocation, `rtk diff -q` compares quietly.\n\
                  \n\
-                 Not flagged: rtk/meta/icm/agent/yzx, and shell builtins and keywords,\n\
-                 which cannot take a prefix. `test` is among them because `rtk test` is\n\
+                 Not flagged: rtk itself, and shell builtins and keywords which cannot\n\
+                 take a prefix. `test` is among them because `rtk test` is\n\
                  the test-RUNNER wrapper and does not evaluate `test -x FILE`.\n\
                  \n\
                  Re-send the command with the prefix; no approval is needed. If a\n\
@@ -763,7 +762,8 @@ struct ToolInput {
     new_string: Option<String>,
     /// NotebookEdit spelling for the replacement cell source.
     new_source: Option<String>,
-    /// Codex/functions.apply_patch freeform payload spellings.
+    /// Legacy/freeform apply_patch payload spellings. Current Codex reports
+    /// canonical `tool_name: "apply_patch"` with the patch in `command`.
     input: Option<String>,
     patch: Option<String>,
     /// MultiEdit-style nested writes.
@@ -787,7 +787,10 @@ struct FileWrite<'a> {
 
 impl ToolInput {
     fn patch_payload(&self) -> Option<&str> {
-        self.patch.as_deref().or(self.input.as_deref())
+        self.patch
+            .as_deref()
+            .or(self.input.as_deref())
+            .or(self.command.as_deref())
     }
 
     fn file_paths(&self) -> Vec<&str> {
@@ -850,22 +853,44 @@ impl ToolInput {
     }
 }
 
+/// Return the operation leaf from direct, local-function, or MCP tool names.
+///
+/// Examples:
+/// - `Write` -> `Write`
+/// - `functions.write_file` -> `write_file`
+/// - `mcp__filesystem__write_file` -> `write_file`
+fn tool_leaf_name(tool_name: &str) -> &str {
+    let leaf = tool_name.rsplit("__").next().unwrap_or(tool_name);
+    let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
+    let leaf = leaf.rsplit(':').next().unwrap_or(leaf);
+    leaf.rsplit('/').next().unwrap_or(leaf)
+}
+
 fn is_apply_patch_tool(tool_name: &str) -> bool {
-    tool_name == "apply_patch" || tool_name.ends_with(".apply_patch")
+    tool_leaf_name(tool_name).eq_ignore_ascii_case("apply_patch")
 }
 
 fn is_file_mutation_tool(tool_name: &str) -> bool {
     matches!(
-        tool_name,
-        "Edit" | "Write" | "NotebookEdit" | "MultiEdit" | "write_file"
+        tool_leaf_name(tool_name).to_ascii_lowercase().as_str(),
+        "edit"
+            | "write"
+            | "notebookedit"
+            | "multiedit"
+            | "write_file"
+            | "create_file"
+            | "update_file"
+            | "replace_file"
+            | "edit_file"
+            | "str_replace"
     ) || is_apply_patch_tool(tool_name)
 }
 
 fn is_file_path_tool(tool_name: &str) -> bool {
     matches!(
-        tool_name,
-        "Edit" | "Write" | "Read" | "NotebookEdit" | "MultiEdit" | "write_file"
-    ) || is_apply_patch_tool(tool_name)
+        tool_leaf_name(tool_name).to_ascii_lowercase().as_str(),
+        "read" | "read_file"
+    ) || is_file_mutation_tool(tool_name)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1792,9 +1817,11 @@ message = "??"
     // ── Denial reason content ─────────────────────────
 
     #[test]
-    fn force_push_reason_suggests_lease() {
+    fn force_push_reason_names_the_non_rewriting_rtk_remedy() {
         let denial = evaluate_command("git push --force").unwrap();
-        assert!(denial.reason.contains("--force-with-lease"));
+        assert!(denial.reason.contains("rtk git pull --rebase"));
+        assert!(denial.reason.contains("rtk git push"));
+        assert!(!denial.reason.contains("operator"));
     }
 
     #[test]
@@ -2868,6 +2895,35 @@ message = "medium priority"
     }
 
     #[test]
+    fn denial_messages_keep_executable_remedies_behind_rtk() {
+        let config = GuardConfig::load();
+        let forbidden = [
+            "\n- git ",
+            "\n- meta ",
+            "\n- cargo ",
+            "\n- jq ",
+            "\n- nix ",
+            "\n  git ",
+            "\n  meta ",
+            "\n  cargo ",
+            "\n  jq ",
+            "\n  nix ",
+            "'claude --version'",
+            "operator-approved",
+        ];
+
+        for pattern in config.patterns {
+            for bare in forbidden {
+                assert!(
+                    !pattern.message.contains(bare),
+                    "{} emits a non-RTK or human-gated remedy containing {bare:?}",
+                    pattern.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rtk_frontdoor_is_deny_by_default_not_an_allowlist() {
         // The point of the rewrite: a tool nobody thought to enumerate is still
         // covered. An allowlist silently permitted all of these.
@@ -2890,14 +2946,35 @@ message = "medium priority"
     fn rtk_frontdoor_accepts_prefixed_and_frontdoor_commands() {
         assert!(evaluate_rtk_frontdoor("rtk git add . && rtk git commit -m \"m\"").is_none());
         assert!(evaluate_rtk_frontdoor("rtk cargo build && rtk cargo test").is_none());
-        // Documented bare invocations: meta-workspace-discipline.md requires
-        // `meta git ...`; CLAUDE.md's ICM section shows `icm store ...`.
-        assert!(evaluate_rtk_frontdoor("meta git status").is_none());
-        assert!(evaluate_rtk_frontdoor("icm recall \"paths\"").is_none());
+        for command in [
+            "rtk meta --version",
+            "rtk icm recall \"paths\"",
+            "rtk agent --version",
+            "rtk yzx --version",
+        ] {
+            assert!(
+                evaluate_rtk_frontdoor(command).is_none(),
+                "prefixed control command denied: {command}"
+            );
+        }
         // An absolute path to the frontdoor is still the frontdoor.
         assert!(
             evaluate_rtk_frontdoor("/home/someone/.nix-profile/toolbin/rtk git status").is_none()
         );
+    }
+
+    #[test]
+    fn rtk_frontdoor_has_no_bare_control_command_bypass() {
+        for command in [
+            "meta --version",
+            "icm recall \"paths\"",
+            "agent --version",
+            "yzx --version",
+        ] {
+            let denial = evaluate_rtk_frontdoor(command)
+                .unwrap_or_else(|| panic!("bare control command escaped: {command}"));
+            assert_eq!(denial.decision, Decision::Deny, "{command}");
+        }
     }
 
     #[test]
@@ -3023,6 +3100,13 @@ message = "medium priority"
             r#"let policy = "/etc/systemd/user""#,
             r#"let candidate = "/usr/bin/nvim""#,
             r#"let scratch = "/tmp/runtime""#,
+            r#"let bare = /srv/runtime"#,
+            r#"let raw = r#'/opt/runtime data'#"#,
+            r#"let interpolated = $"/var/lib/(whoami)""#,
+            r#"let backtick = `/nix/store/runtime path`"#,
+            r#"let roots = [/etc/runtime /usr/runtime]"#,
+            r#"let record = { path: /tmp/runtime }"#,
+            r#"let filesystem_root = "/""#,
         ] {
             assert!(
                 evaluate_path_law_for_target(source, Some("/w/runtime.nu")).is_some(),
@@ -3038,6 +3122,10 @@ message = "medium priority"
             ),
             (r#"const ROOT = "/home/alice/example""#, "/w/evidence.md"),
             (r#"const ROOT = "/home/alice/example""#, "/w/flake.nix"),
+            (
+                r#"let upstream = "https://www.nushell.sh/book/operators""#,
+                "/w/runtime.nu",
+            ),
         ] {
             assert!(
                 evaluate_path_law_for_target(source, Some(target)).is_none(),
@@ -3132,5 +3220,61 @@ message = "medium priority"
             }),
             "nested edit escaped the path law"
         );
+    }
+
+    #[test]
+    fn codex_apply_patch_uses_the_documented_command_payload() {
+        let input: ToolInput = serde_json::from_str(
+            r#"{
+                "command": "*** Begin Patch\n*** Update File: runtime.nu\n@@\n+const ROOT = \"/srv/runtime\"\n*** End Patch\n"
+            }"#,
+        )
+        .expect("valid Codex apply_patch payload");
+
+        assert_eq!(
+            input.patch_payload(),
+            Some(
+                "*** Begin Patch\n*** Update File: runtime.nu\n@@\n+const ROOT = \"/srv/runtime\"\n*** End Patch\n"
+            )
+        );
+    }
+
+    #[test]
+    fn namespaced_file_tools_are_normalized_by_operation_leaf() {
+        for tool in [
+            "Write",
+            "functions.write_file",
+            "functions::edit_file",
+            "mcp__filesystem__write_file",
+            "mcp__filesystem__str_replace",
+        ] {
+            assert!(
+                is_file_mutation_tool(tool),
+                "writer tool was not normalized: {tool}"
+            );
+            assert!(
+                is_file_path_tool(tool),
+                "writer tool skipped path validation: {tool}"
+            );
+        }
+
+        for tool in ["Read", "functions.read_file", "mcp__filesystem__read_file"] {
+            assert!(
+                is_file_path_tool(tool),
+                "reader tool skipped path validation: {tool}"
+            );
+            assert!(
+                !is_file_mutation_tool(tool),
+                "reader tool was treated as a writer: {tool}"
+            );
+        }
+
+        for tool in [
+            "apply_patch",
+            "functions.apply_patch",
+            "mcp__filesystem__apply_patch",
+        ] {
+            assert!(is_apply_patch_tool(tool), "patch tool escaped: {tool}");
+        }
     }
 }

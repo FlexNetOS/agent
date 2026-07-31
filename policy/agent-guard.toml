@@ -104,6 +104,9 @@ decision = "deny"
 matcher = { type = "regex", pattern = '--dangerously-skip-permissions' }
 message = """
 LAW: --dangerously-skip-permissions is forbidden on this machine, no exceptions.
+Continue in the current session. The only permitted Claude CLI diagnostics are:
+  rtk claude --version
+  rtk claude doctor
 """
 
 [[patterns]]
@@ -115,8 +118,9 @@ matcher = { type = "regex", pattern = '^\s*(rtk\s+|sudo\s+)?claude(\s|$)' }
 validator = { type = "all_of", validators = [{ type = "not_contains", value = "--version" }, { type = "not_contains", value = "claude update" }, { type = "not_contains", value = "claude doctor" }] }
 message = """
 Nested Claude sessions are denied (recursion containment). Allowed:
-'claude --version', 'claude update', 'claude doctor'. Use teams/subagents/background
-bash instead. (Baseline rule; guard-bash.sh refines with quote-aware parsing.)
+`rtk claude --version`, `rtk claude update`, `rtk claude doctor`. Use the
+current session's teams/subagents/background work instead of starting another
+Claude process. (Baseline rule; guard-bash.sh refines with quote-aware parsing.)
 """
 
 # ── git topology protection ─────────────────────────────────────────────────
@@ -131,6 +135,8 @@ validator = { type = "args_match_any", command = "push", values = ["main", "mast
 message = """
 Force-push (any variant, including --force-with-lease and +refspec) touching
 main/master/develop is forbidden — long-lived branches are upgrade-only history.
+Reconcile and publish an additive commit instead:
+  rtk git pull --rebase origin <branch> && rtk git push origin <branch>
 """
 
 [[patterns]]
@@ -142,10 +148,10 @@ matcher = { type = "regex", pattern = 'git\s+push.*(--force|-f)\b' }
 validator = { type = "not_contains", value = "--force-with-lease" }
 message = """
 git push --force in a multi-repo workspace can overwrite history across \
-multiple repos. Safer alternatives:
-- git push --force-with-lease on a private feature branch (operator-approved)
-- meta --include <repo> exec -- git push (target one repo)
-- meta git snapshot create <name> before risky pushes
+multiple repos. Reconcile or publish without rewriting:
+- rtk git pull --rebase origin <branch> && rtk git push origin <branch>
+- rtk git push origin HEAD:refs/heads/<new-branch>
+- rtk meta git snapshot create <name>
 """
 
 [[patterns]]
@@ -185,6 +191,8 @@ matcher = { type = "regex", pattern = 'git\s+branch.*\s+-[a-zA-Z]*D[a-zA-Z]*(\s|
 validator = { type = "args_match_any", command = "branch", values = ["main", "master", "develop"] }
 message = """
 Topology invariant: main/master/develop are long-lived and never force-deleted.
+Inspect the branch and leave the long-lived ref intact:
+  rtk git branch -v
 """
 
 [[patterns]]
@@ -196,9 +204,9 @@ matcher = { type = "regex", pattern = 'git\s+branch.*\s+-[a-zA-Z]*D[a-zA-Z]*(\s|
 message = """
 git branch -D force-deletes branches, potentially losing unmerged work. \
 Safer alternatives:
-- git branch -d <branch> (safe delete — only works if merged)
-- git branch -v to check merge status first
-- meta git snapshot create <name> before deleting
+- rtk git branch -d <branch> (safe delete — only works if merged)
+- rtk git branch -v
+- rtk meta git snapshot create <name>
 """
 
 [[patterns]]
@@ -209,7 +217,8 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'git[-\s]+filter-branch|git[-\s]+filter-repo|git\s+reflog\s+expire.*--expire|git\s+gc\b.*--prune=now' }
 message = """
 History rewrites / reflog destruction are forbidden (LAW 1 + upgrade-only).
-Archive instead.
+Archive instead:
+  rtk meta git snapshot create <name>
 """
 
 [[patterns]]
@@ -221,8 +230,8 @@ matcher = { type = "regex", pattern = 'git\s+reset.*--hard\b' }
 message = """
 git reset --hard destroys uncommitted work. In a multi-repo workspace, \
 this can silently discard changes across repos. Safer alternatives:
-- meta git snapshot create <name> (save state first)
-- meta git snapshot restore <name> (reversible reset)
+- rtk meta git snapshot create <name> (save state first)
+- rtk meta git snapshot restore <name> (reversible reset)
 """
 
 [[patterns]]
@@ -235,8 +244,8 @@ validator = { type = "flags_present", command = "clean", flags = ["f", "d"] }
 message = """
 git clean -fd removes untracked files and directories permanently. \
 Safer alternatives:
-- git clean -nd (dry run — preview what would be removed)
-- meta git snapshot create <name> before cleaning
+- rtk git clean -nd (dry run — preview what would be removed)
+- rtk meta git snapshot create <name> before cleaning
 """
 
 [[patterns]]
@@ -247,8 +256,8 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'git\s+checkout\s+(--\s+)?\.(\s|$)' }
 message = """
 git checkout . reverts all modified files. Safer alternatives:
-- git checkout -- <specific-file> (target specific files)
-- meta git snapshot create <name> before reverting
+- rtk git checkout -- <specific-file> (target specific files)
+- rtk meta git snapshot create <name> before reverting
 """
 
 [[patterns]]
@@ -259,9 +268,9 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'git\s+stash\s+drop\b' }
 message = """
 git stash drop permanently removes a stash entry. Safer alternatives:
-- git stash list to review what will be dropped
-- git stash show <stash> to inspect contents first
-- git stash apply <stash> instead of pop (preserves the stash)
+- rtk git stash list
+- rtk git stash show <stash>
+- rtk git stash apply <stash> (preserves the stash)
 """
 
 [[patterns]]
@@ -272,9 +281,9 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'git\s+stash\s+clear\b' }
 message = """
 git stash clear removes ALL stash entries permanently. Safer alternatives:
-- git stash list to review what will be cleared
-- git stash drop <stash> to remove specific entries one at a time (guarded)
-- meta git snapshot create <name> before clearing (captures all stashes)
+- rtk git stash list
+- rtk git stash drop <stash> (guarded, one entry at a time)
+- rtk meta git snapshot create <name> (captures all stashes)
 """
 
 # ── filesystem protection ───────────────────────────────────────────────────
@@ -289,9 +298,9 @@ validator = { type = "all_of", validators = [{ type = "flags_present", command =
 message = """
 rm -rf on dangerous paths could destroy repo roots or workspace data. \
 LAW 1: never delete, always archive. Safer alternatives:
-- Remove specific scratch files instead of entire directories
-- meta --dry-run exec -- <cmd> to preview operations
-- meta git snapshot create <name> before destructive operations
+- rtk git status --short (identify the exact scratch targets)
+- rtk meta --dry-run exec -- <cmd> (preview the scoped operation)
+- rtk meta git snapshot create <name>
 (Hook adapters may apply parser refinements, but this policy remains the
 decision source.)
 """
@@ -308,7 +317,9 @@ decision = "deny"
 matcher = { type = "regex", pattern = 'rm(?:\s+[-\w=]+)*\s+(?:["\x27]?(?:(?:\./|\.\./)|(?:[^\s"\x27]+/))*["\x27]?)?\.meta(?:["\x27]?\.ya?ml)?["\x27]?(?:/)?(?:\s|$)' }
 message = """
 Deleting a protected Meta manifest is forbidden. Preserve control-plane
-metadata; use a reviewed migration or archive workflow instead.
+metadata. Inspect and snapshot it before a reviewed migration:
+  rtk git diff -- .meta .meta.yaml .meta.yml
+  rtk meta git snapshot create <name>
 """
 
 # ── path law ────────────────────────────────────────────────────────────────
@@ -411,7 +422,7 @@ is cleared on logout -- a workspace build reached 30G there and drove it to 84%.
 The symptom is a binary that "does not exist" right after cargo reports success.
 Use the durable surface: $CARGO_HOME / $CARGO_TARGET_DIR are already exported.
 Never assume ./target either -- ask cargo where it actually put things:
-  cargo metadata --format-version 1 --no-deps | jq -r .target_directory
+  rtk cargo metadata --format-version 1 --no-deps | rtk jq -r .target_directory
 $XDG_RUNTIME_DIR is correct for genuinely disposable caches, and only those.
 """
 
@@ -804,7 +815,7 @@ Working example -- packaging/icm_release.nix:
 
 If a raw `cargo build` fails on a -sys crate, build it through nix, or use the
 CI devshell that already carries pkg-config:
-  nix develop path:<yazelix>#ci
+  rtk nix develop path:<yazelix>#ci
 """
 
 [[patterns]]
@@ -928,7 +939,7 @@ edit and does not trip this rule; adding or keeping one does.
 #
 # The sanctioned cutover is deliberately NOT matched. Installing a project flake
 # OUTPUT is how the profile is built:
-#   nix profile add --refresh --profile <profile> github:<org>/<repo>#<output>
+#   rtk nix profile add --refresh --profile <profile> github:<org>/<repo>#<output>
 # What is denied is pulling an INDIVIDUAL package out of the general registry
 # into the profile, which is the drift this section exists to stop.
 
