@@ -493,21 +493,27 @@ documented committer.
 #                                literal /tmp fallback named in the header above
 #                      Every read goes through nonempty_env(), so EMPTY IS UNSET.
 #
-#  2 CARGO AND FENIX   Upstream sets NO cargo home and NO cargo target dir
-#                      anywhere, and ships no rust-toolchain file. Fenix IS
-#                      upstream but arrives TRANSITIVELY: it is absent from all
-#                      14 root inputs and enters through four component flakes --
-#                      yazelixScreen, yazelixZellijBar,
-#                      yazelixZellijPaneOrchestrator, yazelixZellijPopup. Read
-#                      flake.lock NODES, not flake.nix declarations, before
-#                      claiming what is upstream, and derive the list rather than
-#                      recalling it -- an earlier revision of this line named
-#                      yazelixHelix, which takes no fenix input at all:
-#                        jq -r '[.nodes | to_entries[]
-#                                | select(.value.inputs.fenix != null)
-#                                | .key] | sort | .[]' flake.lock
-#                      This fork's flake.nix composes fenix and owns it
-#                      (see paths.rustup_not_used).
+#  2 CARGO AND FENIX   The landed FlexNetOS Yazelix flake explicitly declares
+#                      fenix as a root input, passes it into outputs, and owns
+#                      the resulting Rust toolchain:
+#                        fenix = {
+#                          url = "github:nix-community/fenix/<pin>";
+#                          inputs.nixpkgs.follows = "nixpkgs";
+#                        };
+#                        fenixPkgs = fenix.packages.${system};
+#                        flexnetosRustToolchain = fenixPkgs.combine [
+#                          latest.cargo latest.rustc latest.rustfmt
+#                          latest.clippy latest.rust-analyzer
+#                        ];
+#                      The profile exposes cargo and its companions only from
+#                      that composed toolchain. Yazelix also owns the substituted
+#                      CARGO_HOME and CARGO_TARGET_DIR values in
+#                      flexnetosNuConfigFor; Fenix supplies the toolchain
+#                      binaries, while Yazelix owns the profile closure and
+#                      durable path surfaces. Never describe Fenix as absent,
+#                      merely transitive, or unrelated to Cargo in this fork.
+#                      Change the toolchain by changing the flake input or its
+#                      composition; never add rustup or a second Cargo owner.
 #
 #  3 AGENT CONFIG      Semantic keys in config.toml, never a config tree:
 #                      agent.command (an executable string, or "auto" to keep the
@@ -799,12 +805,14 @@ enabled = true
 decision = "deny"
 matcher = { type = "regex", pattern = 'RUSTUP_HOME|rustup\s+(install|default|toolchain|override)' }
 message = """
-This profile has no rustup. The Rust toolchain comes from FENIX
-(nix-community), composed in the yazelix flake:
+This profile has no rustup. The Rust toolchain comes from the explicitly
+declared FENIX input in the Yazelix flake (nix-community):
 
   flexnetosRustToolchain = fenixPkgs.combine [cargo rustc rustfmt clippy rust-analyzer]
 
-fenix REPLACES rustup -- the MSRV lane even wraps cargo with
+Fenix supplies the Cargo toolchain; Yazelix owns the composed profile closure
+and its substituted CARGO_HOME/CARGO_TARGET_DIR surfaces. Fenix REPLACES rustup
+-- the MSRV lane even wraps cargo with
 --unset RUSTUP_TOOLCHAIN. Setting RUSTUP_HOME or invoking rustup introduces a
 second toolchain owner. To change the toolchain, edit the flake input.
 """
@@ -1103,4 +1111,3 @@ To make it permanent, declare it as a flake input and let the profile own it.
 # "tools that need the prefix" was the wrong shape -- it silently permits every
 # command nobody remembered to list, which is the same hole the rule exists to
 # close.
-
