@@ -689,11 +689,38 @@ Reading, listing or grepping environment.d is not matched here -- only writing.
 """
 
 [[patterns]]
+id = "paths.code_discipline_generated_copy"
+priority = 200
+enabled = true
+decision = "deny"
+matcher = { type = "regex", pattern = '(\A|(^|[\s;&|(])(cp|mv|ln|install|tee|touch|rsync)\s[^;&|]*|>>?\s*)[^\s;&|]*var/lib/claude/CODE-DISCIPLINE\.md' }
+validator = { type = "not_contains", value = ".claude/CODE-DISCIPLINE.md" }
+message = """
+Regenerate this copy from its canonical source instead of editing it:
+
+  rtk cp /home/flexnetos/meta/.claude/CODE-DISCIPLINE.md /home/flexnetos/meta/var/lib/claude/CODE-DISCIPLINE.md
+
+The 10 laws have one owner and one producer, so they read the same in every
+session:
+  CANONICAL  meta's tracked .claude/CODE-DISCIPLINE.md, which meta's CLAUDE.md
+             loads as @.claude/CODE-DISCIPLINE.md
+  DERIVED    this copy in the Claude home, which that home's CLAUDE.md loads as
+             @CODE-DISCIPLINE.md
+
+/var/ is gitignored, so a hand edit here appears in no diff and the two copies
+drift silently -- the same failure the generated user-level policy copy already
+caused once. Editing a generated file in place creates a second owner of it.
+
+A cp whose source is the canonical file is allowed, and reading, listing or
+grepping the derived copy is not matched here -- only writing it.
+"""
+
+[[patterns]]
 id = "paths.surface_pinned_in_source"
 priority = 200
 enabled = true
 decision = "deny"
-matcher = { type = "regex", pattern = '["\x27](?:/home/|/run/user/|/nix/store/)' }
+matcher = { type = "regex", pattern = '["\x27]/' }
 message = """
 This pins an absolute path inside a Nushell runtime source file. Upstream's startup
 boundary is "Owned by runtime/yzx/ (Nix substitutes paths; Rust owns wiring and
